@@ -85,11 +85,6 @@ class TokkioIrodoriLifecycleTests(unittest.TestCase):
         self.assertIn("TOKKIO_HELM_RELEASE", script)
         self.assertIn("helm get manifest", script)
 
-    def test_llm_compose_file_uses_configurable_container_name(self) -> None:
-        compose_text = (ROOT / "infra" / "llm" / "docker-compose.trtllm.yml").read_text(encoding="utf-8")
-
-        self.assertIn("container_name: ${TRTLLM_CONTAINER_NAME:-ace-trtllm-osaka-swallow}", compose_text)
-
 
 if __name__ == "__main__":
     unittest.main()

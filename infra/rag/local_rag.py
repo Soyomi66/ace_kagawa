@@ -880,7 +880,7 @@ def _rows_to_hits(rows: Iterable[sqlite3.Row]) -> list[LocalRagHit]:
 def _query_intents(query: str) -> set[str]:
     compact = re.sub(r"\s+", "", normalize_query(query)).lower()
     intents: set[str] = set()
-    if any(term in compact for term in ("アクセス", "行き方", "交通", "駅", "バス")):
+    if any(term in compact for term in ("アクセス", "行き方", "交通", "駅", "バス", "住所", "所在地")):
         intents.add("access")
     if any(
         term in compact
@@ -902,6 +902,7 @@ def _query_intents(query: str) -> set[str]:
             "入学試験日",
             "試験日",
             "入学手続期限",
+            "納入金",
         )
     ):
         intents.add("admissions")
@@ -934,7 +935,7 @@ def _query_intents(query: str) -> set[str]:
         intents.add("admission_subjects")
     if "admissions" in intents and any(term in compact for term in ("選抜方法", "配点", "面接試験", "プレゼンテーション")):
         intents.add("admission_selection_method")
-    if any(term in compact for term in ("学費", "入学金", "授業料")):
+    if any(term in compact for term in ("学費", "入学金", "授業料", "納入金")):
         intents.add("admission_tuition")
     if any(term in compact for term in ("奨学金", "奨学生")):
         intents.add("admission_scholarship")
@@ -2421,6 +2422,9 @@ def grounded_direct_reply(
     compact = re.sub(r"\s+", "", normalize_query(query))
     evidence = " ".join(hit.text for hit in hits)
     if route.domain == "access":
+        if "住所" in compact or "所在地" in compact:
+            # The fixed replies are the routes from the stations; the address is in the context.
+            return None
         if "八王子" in compact:
             return next((hit.text.strip() for hit in hits if "八王子" in hit.text), None)
         if "蒲田" in compact:

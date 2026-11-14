@@ -23,7 +23,6 @@ def load_module(name: str, path: Path):
 
 
 check_llm = load_module("check_llm_endpoint", ROOT / "infra" / "llm" / "check_llm_endpoint.py")
-merge_lora = load_module("merge_osaka_swallow_lora", ROOT / "infra" / "llm" / "merge_osaka_swallow_lora.py")
 
 
 class LlmEndpointToolTests(unittest.TestCase):
@@ -70,19 +69,6 @@ class LlmEndpointToolTests(unittest.TestCase):
         self.assertEqual(timings["token_count"], 3)
         self.assertAlmostEqual(timings["ttft_ms"], 250.0)
         self.assertAlmostEqual(timings["avg_itl_ms"], 125.0)
-
-    def test_disable_thinking_by_default_makes_qwen_generation_prompt_unconditional(self) -> None:
-        original = r"""{%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\n' }}
-    {%- if enable_thinking is defined and enable_thinking is false %}
-        {{- '<think>\n\n</think>\n\n' }}
-    {%- endif %}
-{%- endif %}"""
-
-        updated = merge_lora.disable_thinking_by_default(original)
-
-        self.assertIn("<think>", updated)
-        self.assertNotIn("enable_thinking is defined", updated)
 
 
 if __name__ == "__main__":

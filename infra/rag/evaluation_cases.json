@@ -143,6 +143,7 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_chunk_ids": [
+        "chunk_tuition_2027_overview",
         "chunk_plain_8975de5172d962ff",
         "chunk_plain_8975de5172d962ff__part_02",
         "chunk_plain_b8d933727a5e1c87"
@@ -186,7 +187,11 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_effective_year": "2027",
-      "required_page_numbers": ["6", "7", "8"],
+      "required_page_numbers": [
+        "6",
+        "7",
+        "8"
+      ],
       "expected_chunk_ids": [
         "chunk_plain_63bee4475dda6c82",
         "chunk_plain_5b15188c2108b392",
@@ -199,7 +204,11 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_effective_year": "2027",
-      "required_page_numbers": ["6", "7", "8"],
+      "required_page_numbers": [
+        "6",
+        "7",
+        "8"
+      ],
       "expected_chunk_ids": [
         "chunk_plain_63bee4475dda6c82",
         "chunk_plain_5b15188c2108b392",
@@ -216,7 +225,11 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_effective_year": "2027",
-      "required_page_numbers": ["6", "7", "8"],
+      "required_page_numbers": [
+        "6",
+        "7",
+        "8"
+      ],
       "expected_chunk_ids": [
         "chunk_plain_63bee4475dda6c82",
         "chunk_plain_5b15188c2108b392",
@@ -229,7 +242,10 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_effective_year": "2027",
-      "required_page_numbers": ["7", "9"],
+      "required_page_numbers": [
+        "7",
+        "9"
+      ],
       "expected_chunk_ids": [
         "chunk_plain_4175616af622693d__part_02",
         "chunk_plain_349b5a50ffce687b__part_02"
@@ -241,6 +257,7 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_chunk_ids": [
+        "chunk_tuition_2027_overview",
         "chunk_plain_82327f513139cfb2",
         "chunk_plain_ac76cdc3ffcf66ae",
         "chunk_plain_8975de5172d962ff"
@@ -574,6 +591,7 @@
       "expectation": "must_rag",
       "domain": "admissions",
       "expected_chunk_ids": [
+        "chunk_tuition_2027_overview",
         "chunk_plain_8975de5172d962ff"
       ]
     },
@@ -595,6 +613,43 @@
         "chunk_plain_63bee4475dda6c82",
         "chunk_plain_5b15188c2108b392",
         "chunk_plain_44bf47828f453d0d"
+      ]
+    },
+    {
+      "id": "tuition_design_faculty",
+      "query": "デザイン学部の学費はいくらですか",
+      "expectation": "must_rag",
+      "domain": "admissions",
+      "expected_chunk_ids": [
+        "chunk_tuition_2027_design",
+        "chunk_tuition_2027_overview"
+      ]
+    },
+    {
+      "id": "kamata_faculties",
+      "query": "蒲田キャンパスには何学部がありますか",
+      "expectation": "must_rag",
+      "domain": "faculties",
+      "expected_chunk_ids": [
+        "chunk_campus_faculties_by_campus"
+      ]
+    },
+    {
+      "id": "university_location",
+      "query": "東京工科大学はどこにありますか",
+      "expectation": "must_rag",
+      "domain": "university",
+      "expected_chunk_ids": [
+        "chunk_university_location_access"
+      ]
+    },
+    {
+      "id": "kamata_address",
+      "query": "蒲田キャンパスの住所を教えてください",
+      "expectation": "must_rag",
+      "domain": "access",
+      "expected_chunk_ids": [
+        "chunk_university_location_access"
       ]
     }
   ]

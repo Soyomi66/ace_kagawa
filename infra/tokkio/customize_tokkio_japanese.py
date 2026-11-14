@@ -15,7 +15,7 @@ from pathlib import Path
 
 DEFAULT_ACE_REPO_DIR = Path(__file__).resolve().parent / "workspace" / "NVIDIA-ACE"
 DEFAULT_LLM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_LLM_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+DEFAULT_LLM_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 DEFAULT_IRODORI_TTS_BASE_URL = "http://10.209.1.12:8021"
 # English IndexTTS-2.5 service. Qwen names remain as compatibility names for
 # the existing OpenAI-compatible HTTP transport and English-mode selector.
@@ -173,7 +173,7 @@ class NvidiaRAGRouterService(BaseModel):
 
 class NvidiaLLMService(BaseModel):
     base_url: str = "https://integrate.api.nvidia.com/v1"
-    model: str = "nvidia/nemotron-3.5-lightning-30b-a3b"
+    model: str = "nvidia/nemotron-3-ultra-550b-a55b"
 
 
 class OpenAILLMService(BaseModel):
@@ -392,7 +392,7 @@ NvidiaRAGRouterService:
 # This configuration is only used when llm_processor is set to "NvidiaLLMService"
 NvidiaLLMService:
     base_url: "https://integrate.api.nvidia.com/v1"
-    model: "nvidia/nemotron-3.5-lightning-30b-a3b"
+    model: "nvidia/nemotron-3-ultra-550b-a55b"
 
 # This configuration is only used when llm_processor is set to "OpenAILLMService"
 OpenAILLMService:

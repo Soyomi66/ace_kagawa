@@ -512,6 +512,10 @@ class RagToolTests(unittest.TestCase):
             access_hit.text,
         )
 
+        # An address question is routed to access, but the station route is not its answer.
+        self.assertEqual(local_rag.classify_query("蒲田キャンパスの住所を教えてください").domain, "access")
+        self.assertIsNone(local_rag.grounded_direct_reply("八王子キャンパスの住所を教えてください", [access_hit]))
+
         profile_hit = hit(
             record_type="kagawa_profile",
             chunk_id="chunk_kagawa_profile",

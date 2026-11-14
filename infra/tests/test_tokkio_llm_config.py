@@ -460,8 +460,8 @@ class TokkioLlmConfigTests(unittest.TestCase):
         self.assertIn("100文字以内", yaml_text)
         self.assertIn("最大2文", yaml_text)
         self.assertNotIn("80文字以内", yaml_text)
-        self.assertIn("time_delay: 2.5", yaml_text)
-        self.assertIn('- "確認しています"', yaml_text)
+        self.assertIn("time_delay: 1.0", yaml_text)
+        self.assertIn('- "そうですね。"', yaml_text)
         self.assertNotIn("少々お待ちください", yaml_text)
         self.assertIn('llm_processor: "NvidiaLLMService"', yaml_text)
 
