@@ -265,7 +265,7 @@ class IrodoriTtsServerTests(unittest.TestCase):
 
         self.assertEqual(
             normalized,
-            "にせんにじゅうななねんどにメディア学部へ入学する場合、"
+            "二千二十七年度にメディア学部へ入学する場合、"
             "いちねんめ前期の合計はきゅうじゅうななまんろくせんさんびゃくえんです。",
         )
 
@@ -287,7 +287,7 @@ class IrodoriTtsServerTests(unittest.TestCase):
 
         self.assertEqual(
             normalized,
-            "期限はにせんにじゅうろくねんじゅうにがつじゅうごにち、"
+            "期限は二千二十六年じゅうにがつじゅうごにち、"
             "利用者はひゃくさんめい、全体のよんじゅっぱーせんと、"
             "電話はぜろよんにのろくさんななのにぜろいちいちです。",
         )
@@ -379,7 +379,7 @@ class IrodoriTtsServerTests(unittest.TestCase):
     def test_normalize_speech_input_reads_dates_days_and_ranges(self) -> None:
         cases = {
             "4/1（火）から開始します。": "しがつ ついたち、火曜日、から開始します。",
-            "2026/4/1です。": "にせんにじゅうろくねんしがつ ついたちです。",
+            "2026/4/1です。": "二千二十六年しがつ ついたちです。",
             "24/7です。": "にじゅうよん/ななです。",
             "4月1日と毎月1日です。": "しがつ ついたちと毎月ついたちです。",
             "1日目と7日間、1日に2回です。": "いちにちめとなのかかん、いちにちににかいです。",
@@ -419,6 +419,7 @@ class IrodoriTtsServerTests(unittest.TestCase):
                 self.request_text: str | None = None
 
             def synthesize(self, request, log_fn=None):
+                self.request = request
                 self.request_text = request.text
                 return FakeResult()
 
@@ -441,6 +442,59 @@ class IrodoriTtsServerTests(unittest.TestCase):
             synthesizer.synthesize(" 香川豊です。 ", response_format="pcm")
 
             self.assertEqual(runtime.request_text, "香川ゆたかです。")
+            self.assertFalse(hasattr(runtime.request, "cfg_scale_caption"))
+        finally:
+            if previous_package is None:
+                sys.modules.pop("irodori_tts", None)
+            else:
+                sys.modules["irodori_tts"] = previous_package
+            if previous_inference_runtime is None:
+                sys.modules.pop("irodori_tts.inference_runtime", None)
+            else:
+                sys.modules["irodori_tts.inference_runtime"] = previous_inference_runtime
+
+    def test_synthesize_passes_caption_strength_and_style_emoji_to_runtime(self) -> None:
+        class FakeSamplingRequest:
+            def __init__(self, **kwargs) -> None:
+                self.__dict__.update(kwargs)
+
+        class FakeResult:
+            audio = np.array([0.0], dtype=np.float32)
+            sample_rate = 16000
+
+        class FakeRuntime:
+            def synthesize(self, request, log_fn=None):
+                self.request = request
+                return FakeResult()
+
+        fake_package = types.ModuleType("irodori_tts")
+        fake_inference_runtime = types.ModuleType("irodori_tts.inference_runtime")
+        fake_inference_runtime.SamplingRequest = FakeSamplingRequest
+        previous_package = sys.modules.get("irodori_tts")
+        previous_inference_runtime = sys.modules.get("irodori_tts.inference_runtime")
+        sys.modules["irodori_tts"] = fake_package
+        sys.modules["irodori_tts.inference_runtime"] = fake_inference_runtime
+        try:
+            settings = irodori_server.IrodoriSettings.from_env(
+                {
+                    "IRODORI_TTS_REFERENCE_SOURCE": __file__,
+                    "IRODORI_TTS_REFERENCE_WAV": __file__,
+                    "IRODORI_TTS_CAPTION": "落ち着いた声で",
+                    "IRODORI_TTS_CAPTION_CFG_SCALE": "5",
+                    "IRODORI_TTS_STYLE_EMOJI": "😊",
+                    "IRODORI_TTS_SYMPATHY_EMOJI": "🫶",
+                }
+            )
+            runtime = FakeRuntime()
+            synthesizer = irodori_server.IrodoriSynthesizer(settings)
+            synthesizer._runtime = runtime
+
+            synthesizer.synthesize("残念でしたね。", response_format="pcm")
+
+            self.assertEqual(runtime.request.text, "🫶残念でしたね。")
+            self.assertEqual(runtime.request.caption, "落ち着いた声で")
+            self.assertEqual(runtime.request.cfg_scale_caption, 5.0)
+            self.assertEqual(runtime.request.max_seconds, synthesizer._max_seconds_for("残念でしたね。"))
         finally:
             if previous_package is None:
                 sys.modules.pop("irodori_tts", None)

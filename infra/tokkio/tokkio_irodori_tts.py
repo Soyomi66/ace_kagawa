@@ -14,10 +14,44 @@ from pipecat.frames.frames import (
     TTSTextFrame,
 )
 
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
+
 try:
     from pipecat.services.tts_service import TTSService
 except ImportError:
     from pipecat.services.ai_services import TTSService
+
+
+# SpeechSegmentBuffer (tokkio_llm.py) cuts a reply's first clause at one of these.
+_CLAUSE_END_CHARS = ("、", "，", ",")
+
+
+class FirstClauseTextAggregator(SimpleTextAggregator):
+    """Speak a reply's first clause without waiting for its sentence to end.
+
+    pipecat's SimpleTextAggregator holds text until 。/？/！, so the first clause
+    would wait for the LLM to finish the whole sentence.  Only the first frame of
+    each reply passes through; later clauses are still joined into sentences.
+    The TTS service calls reset() at the end of every reply.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._at_reply_start = True
+
+    async def aggregate(self, text: str) -> str | None:
+        at_reply_start, self._at_reply_start = self._at_reply_start, False
+        if at_reply_start and not self.text and text.rstrip().endswith(_CLAUSE_END_CHARS):
+            return text
+        return await super().aggregate(text)
+
+    async def handle_interruption(self) -> None:
+        await super().handle_interruption()
+        self._at_reply_start = True
+
+    async def reset(self) -> None:
+        await super().reset()
+        self._at_reply_start = True
 
 
 async def _prepend_chunk(first: bytes, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
@@ -37,8 +71,11 @@ class IrodoriTTSService(TTSService):
         response_format: str = "pcm",
         stream_audio: bool = True,
         stream_chunk_bytes: int = 3200,
+        start_on_first_clause: bool = False,
         **kwargs,
     ) -> None:
+        if start_on_first_clause:
+            kwargs.setdefault("text_aggregator", FirstClauseTextAggregator())
         super().__init__(
             sample_rate=sample_rate,
             push_text_frames=False,

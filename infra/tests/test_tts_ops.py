@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[2]
 MANAGE_SCRIPT = ROOT / "infra" / "tokkio" / "manage_tokkio.sh"
 INSTALL_SCRIPT = ROOT / "infra" / "tts" / "install_irodori_tts_service.sh"
+SOKUTOU_WRAPPER = ROOT / "infra" / "tts" / "run_sokutou_tts.sh"
+SOKUTOU_ENTRY = ROOT / "infra" / "tts" / "sokutou_entry.py"
 # en-tts/ (English IndexTTS) is optional in a checkout; its cases skip without it.
 HAS_EN_TTS = (ROOT / "en-tts").is_dir()
 TTS_UNITS =tuple(sorted((ROOT / "infra" / "tts").glob("*.service"))) + tuple(
@@ -85,7 +87,9 @@ def repo_path_for(absolute: str) -> Path:
 
 
 def server_source(unit: Unit) -> str:
-    return repo_path_for(unit.exec_start[1]).read_text(encoding="utf-8")
+    # `python server.py` names the server second; a wrapper script (ace-sokutou-tts.service) is ExecStart itself.
+    target = unit.exec_start[1] if len(unit.exec_start) > 1 else unit.exec_start[0]
+    return repo_path_for(target).read_text(encoding="utf-8")
 
 
 def string_literals(source: str) -> set[str]:
@@ -160,6 +164,136 @@ class TtsUnitConsistencyTests(unittest.TestCase):
                 if unit_path.is_relative_to(ROOT / "en-tts") and not HAS_EN_TTS:
                     self.skipTest("en-tts/ not present")
                 self.assertEqual(urlsplit(match.group(1)).port, int(parse_unit(unit_path).environment[port_key]))
+
+    def test_sokutou_unit_matches_the_service_that_calls_it(self) -> None:
+        service_path = ROOT / "infra" / "tts" / "ace-irodori-tts.service"
+        container_path = ROOT / "infra" / "tts" / "ace-sokutou-tts.service"
+        service = parse_unit(service_path).environment
+        container = parse_unit(container_path).environment
+        if service.get("IRODORI_TTS_BACKEND") != "sokutou":
+            self.skipTest("the service does not use the sokutou backend")
+
+        self.assertEqual(container["SOKUTOU_TTS_NUM_STEPS"], service["IRODORI_TTS_NUM_STEPS"])
+        self.assertEqual(urlsplit(service["IRODORI_TTS_SOKUTOU_URL"]).port, int(container["SOKUTOU_TTS_PORT"]))
+        self.assertEqual(container["SOKUTOU_TTS_REFERENCE_WAV"], service["IRODORI_TTS_REFERENCE_WAV"])
+        self.assertEqual(container["SOKUTOU_TTS_VOICE"], service["IRODORI_TTS_VOICE"])
+        self.assertEqual(container["SOKUTOU_TTS_HF_HOME"], service["HF_HOME"])
+        self.assertNotIn("IRODORI_TTS_CAPTION", service)
+        service_text = service_path.read_text(encoding="utf-8")
+        container_text = container_path.read_text(encoding="utf-8")
+        self.assertRegex(service_text, r"(?m)^After=.*\bace-sokutou-tts\.service\b")
+        # The installer's enable/disable is the only link, so switching the backend line switches the engine.
+        self.assertNotRegex(service_text, r"(?m)^(Wants|Requires|BindsTo)=.*\bace-sokutou-tts\.service\b")
+        self.assertRegex(container_text, r"(?m)^WantedBy=ace-irodori-tts\.service$")
+        # A crash of the service must not take the warm engine down with it.
+        self.assertNotRegex(container_text, r"(?m)^(PartOf|BindsTo|StopPropagatedFrom)=")
+
+    def test_sokutou_wrapper_reads_exactly_the_unit_variables(self) -> None:
+        unit = parse_unit(ROOT / "infra" / "tts" / "ace-sokutou-tts.service")
+        read = set(re.findall(r"\$\{(SOKUTOU_TTS_[A-Z_]+)", SOKUTOU_WRAPPER.read_text(encoding="utf-8")))
+
+        self.assertEqual({key for key in unit.environment if key.startswith("SOKUTOU_TTS_")}, read)
+
+
+class SokutouContainerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.log = self.root / "shim.log"
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        write_executable(self.bin_dir / "docker", '#!/usr/bin/env bash\necho "docker $*" >> "${SHIM_LOG}"\nexit 0\n')
+        self.reference = self.root / "reference" / "ref.wav"
+        self.reference.parent.mkdir()
+        self.reference.write_bytes(b"wav")
+        self.hf_home = self.root / "hf-cache"
+        (self.hf_home / "hub").mkdir(parents=True)
+
+    def run_wrapper(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        env = {key: value for key, value in os.environ.items() if not key.startswith("SOKUTOU_")}
+        env.update(
+            PATH=f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}",
+            SHIM_LOG=str(self.log),
+            SOKUTOU_TTS_IMAGE="ace-kagawa/sokutou-server:test",
+            SOKUTOU_TTS_CONTAINER="ace-sokutou-tts",
+            SOKUTOU_TTS_GPU_UUID="GPU-test",
+            SOKUTOU_TTS_PORT="8026",
+            SOKUTOU_TTS_NUM_STEPS="12",
+            SOKUTOU_TTS_VOICE="kagawa",
+            SOKUTOU_TTS_REFERENCE_WAV=str(self.reference),
+            SOKUTOU_TTS_HF_HOME=str(self.hf_home),
+        )
+        env.update(overrides)
+        return subprocess.run([BASH, str(SOKUTOU_WRAPPER)], env=env, capture_output=True, text=True, timeout=30, check=False)
+
+    def calls(self) -> list[str]:
+        return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+
+    def test_wrapper_replaces_a_stale_container_and_runs_the_entry_on_the_gpu(self) -> None:
+        result = self.run_wrapper()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        remove, run = self.calls()
+        self.assertEqual(remove, "docker rm -f ace-sokutou-tts")
+        argv = shlex.split(run)
+        self.assertEqual(argv[:5], ["docker", "run", "--rm", "--name", "ace-sokutou-tts"])
+        self.assertEqual(argv[argv.index("--gpus") + 1], "device=GPU-test")
+        self.assertEqual(argv[argv.index("-p") + 1], "127.0.0.1:8026:8088")
+        mounts = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-v"]
+        self.assertEqual(
+            mounts,
+            [
+                f"{self.hf_home}:/root/.cache/huggingface:ro",
+                f"{self.reference}:/voices/kagawa/ref.wav:ro",
+                f"{SOKUTOU_ENTRY}:/opt/ace/sokutou_entry.py:ro",
+            ],
+        )
+        envs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "-e"]
+        self.assertEqual(envs, ["HF_HUB_OFFLINE=1", "IRODORI_NUM_STEPS=12", "EMPTY_CACHE_EVERY=0", "OUTPUT_SAMPLE_RATE=48000"])
+        self.assertEqual(argv[-3:], ["ace-kagawa/sokutou-server:test", "/opt/irodori/.venv/bin/python", "/opt/ace/sokutou_entry.py"])
+
+    def test_wrapper_stops_before_docker_without_the_reference(self) -> None:
+        self.reference.unlink()
+
+        result = self.run_wrapper()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(self.reference), result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_wrapper_needs_the_steps(self) -> None:
+        result = self.run_wrapper(SOKUTOU_TTS_NUM_STEPS="")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SOKUTOU_TTS_NUM_STEPS", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_entry_keeps_the_text_as_the_service_sent_it(self) -> None:
+        # sokutou's server.py adds 「。」 to text without a sentence end; the entry must undo only that.
+        (self.root / "server.py").write_text(
+            "def normalize_text(text):\n"
+            "    text = ' '.join(text.split())\n"
+            "    return text if text.endswith('。') else text + '。'\n",
+            encoding="utf-8",
+        )
+        (self.root / "engine").mkdir()
+        (self.root / "engine" / "__init__.py").write_text("", encoding="utf-8")
+        out = self.root / "out.json"
+        (self.root / "engine" / "serve.py").write_text(
+            "import json, sys\n"
+            "import server\n"
+            "if __name__ == '__main__':\n"
+            f"    texts = [' 😊私は複合材料、 ', '😊確認しています', '😊こんにちは。', '😊A  B']\n"
+            f"    open({str(out)!r}, 'w').write(json.dumps([server.normalize_text(t) for t in texts], ensure_ascii=False))\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ, PYTHONPATH=str(self.root))
+
+        result = subprocess.run([sys.executable, str(SOKUTOU_ENTRY)], env=env, capture_output=True, text=True, timeout=30, check=False)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8")), ["😊私は複合材料、", "😊確認しています", "😊こんにちは。", "😊A B"])
 
 
 class FakeTtsHandler(http.server.BaseHTTPRequestHandler):
@@ -351,6 +485,7 @@ INSTALL_SHIMS = {
         "#!/usr/bin/env bash\n"
         'echo "systemctl $*" >> "${SHIM_LOG}"\n'
         'if [[ "$1" == is-active ]]; then exit "${SHIM_IS_ACTIVE_RC:-3}"; fi\n'
+        'if [[ "$1" == is-enabled ]]; then exit "${SHIM_IS_ENABLED_RC:-1}"; fi\n'
         "exit 0\n"
     ),
     "ffmpeg": (
@@ -359,6 +494,12 @@ INSTALL_SHIMS = {
         'out="${*: -1}"\n'
         'mkdir -p "$(dirname "${out}")"\n'
         ': > "${out}"\n'
+    ),
+    "docker": (
+        "#!/usr/bin/env bash\n"
+        'echo "docker $*" >> "${SHIM_LOG}"\n'
+        'if [[ "$1 $2" == "image inspect" ]]; then exit "${SHIM_DOCKER_IMAGE_RC:-0}"; fi\n'
+        "exit 0\n"
     ),
 }
 INSTALL_TOOLS = ("bash", "dirname", "sed", "grep", "head", "tail", "cat", "mkdir", "touch")
@@ -526,6 +667,102 @@ class IrodoriInstallerTests(unittest.TestCase):
         self.assertIn(str(model), result.stderr)
         self.assertFalse([call for call in self.calls() if call.startswith("sudo ")])
 
+    def use_sokutou_unit(self, *, steps: str = "12") -> Path:
+        unit = self.script.parent / "ace-irodori-tts.service"
+        unit.write_text(
+            unit.read_text(encoding="utf-8").replace(
+                "[Service]\n",
+                "[Service]\nEnvironment=IRODORI_TTS_BACKEND=sokutou\nEnvironment=IRODORI_TTS_NUM_STEPS=12\n",
+            ),
+            encoding="utf-8",
+        )
+        container = self.script.parent / "ace-sokutou-tts.service"
+        container.write_text(
+            "[Service]\n"
+            "Environment=SOKUTOU_TTS_IMAGE=ace-kagawa/sokutou-server:test\n"
+            f"Environment=SOKUTOU_TTS_NUM_STEPS={steps}\n"
+            f"Environment=SOKUTOU_TTS_REFERENCE_WAV={self.reference_wav}\n",
+            encoding="utf-8",
+        )
+        return container
+
+    def test_installer_installs_the_sokutou_unit_with_the_service(self) -> None:
+        container = self.use_sokutou_unit()
+
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertIn("docker image inspect ace-kagawa/sokutou-server:test", calls)
+        install = f"sudo install -m 0644 {container} /etc/systemd/system/ace-sokutou-tts.service"
+        self.assertIn(install, calls)
+        self.assertLess(calls.index(install), calls.index("sudo systemctl daemon-reload"))
+        self.assertLess(calls.index("sudo systemctl daemon-reload"), calls.index("sudo systemctl enable ace-sokutou-tts.service"))
+
+    def test_installer_disables_the_container_unit_for_another_backend(self) -> None:
+        self.use_speechcpp_unit(with_voice=True)
+
+        result = self.run_installer(SHIM_IS_ENABLED_RC="0")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sudo systemctl disable ace-sokutou-tts.service", self.calls())
+
+    def test_installer_leaves_a_container_unit_that_is_not_enabled(self) -> None:
+        result = self.run_installer()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([call for call in self.calls() if "able ace-sokutou-tts" in call])
+
+    def test_installer_stops_before_sudo_without_the_sokutou_image(self) -> None:
+        self.use_sokutou_unit()
+
+        result = self.run_installer(SHIM_DOCKER_IMAGE_RC="1")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ace-kagawa/sokutou-server:test", result.stderr)
+        self.assertIn("README.md", result.stderr)
+        self.assertFalse([call for call in self.calls() if call.startswith("sudo ")])
+
+    def test_installer_refuses_container_steps_that_differ_from_the_service(self) -> None:
+        self.use_sokutou_unit(steps="20")
+
+        result = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SOKUTOU_TTS_NUM_STEPS", result.stderr)
+        self.assertFalse([call for call in self.calls() if call.startswith("sudo ")])
+
+    def test_installer_restarts_the_container_before_the_service(self) -> None:
+        self.use_sokutou_unit()
+
+        result = self.run_installer("--restart")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertLess(
+            calls.index("sudo systemctl try-restart ace-sokutou-tts.service"),
+            calls.index("sudo systemctl try-restart ace-irodori-tts.service"),
+        )
+
+    def test_installer_stops_the_container_when_another_backend_restarts(self) -> None:
+        self.use_speechcpp_unit(with_voice=True)
+
+        result = self.run_installer("--restart", SHIM_IS_ACTIVE_RC="0")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertIn("sudo systemctl stop ace-sokutou-tts.service", calls)
+        self.assertFalse([call for call in calls if call.startswith("docker ")])
+
+    def test_installer_warns_about_a_container_left_by_the_sokutou_backend(self) -> None:
+        self.use_speechcpp_unit(with_voice=True)
+
+        result = self.run_installer(SHIM_IS_ACTIVE_RC="0")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sudo systemctl stop ace-sokutou-tts.service", result.stderr)
+        self.assertNotIn("sudo systemctl stop ace-sokutou-tts.service", self.calls())
+
     def test_installer_rejects_unknown_arguments(self) -> None:
         result = self.run_installer("--bogus")
 
@@ -569,6 +806,9 @@ CONTROLLER_SOURCE_FILES = (
     "tokkio_llm.py",
     "tokkio_irodori_tts.py",
     "tokkio_rag.py",
+    "tokkio_speechcpp_stt.py",
+    "tokkio_web_search.py",
+    "tokkio_turn.py",
 )
 CONTROLLER_DEPLOYMENT = "ace-controller-ace-controller-deployment"
 MANAGE_SHIMS = {
@@ -589,6 +829,13 @@ case "$1" in
   start)
     if [[ " ${SHIM_FAILING_STARTS:-} " == *" ${unit} "* ]]; then
       exit 5
+    fi
+    ;;
+  show)
+    if [[ " ${SHIM_LOADED_UNITS:-} " == *" ${unit} "* ]]; then
+      echo loaded
+    else
+      echo not-found
     fi
     ;;
 esac
@@ -694,6 +941,8 @@ class ManageTokkioTtsLifecycleTests(unittest.TestCase):
             "TOKKIO_IRODORI_TTS_WAIT_SECONDS=0",
             "TOKKIO_QWEN_TTS_WAIT_ATTEMPTS=3",
             "TOKKIO_QWEN_TTS_WAIT_SECONDS=0",
+            "TOKKIO_SPEECHCPP_ASR_WAIT_ATTEMPTS=3",
+            "TOKKIO_SPEECHCPP_ASR_WAIT_SECONDS=0",
             "TOKKIO_APP_WORKLOAD_WAIT_ATTEMPTS=1",
             "TOKKIO_APP_WORKLOAD_WAIT_SECONDS=0",
             "TOKKIO_ENDPOINT_WAIT_ATTEMPTS=3",
@@ -968,6 +1217,124 @@ class ManageTokkioTtsLifecycleTests(unittest.TestCase):
 
         self.assertNotIn("ace-indextts-tts.service is active", result.stderr)
 
+
+    def select_speechcpp_stt(self) -> None:
+        (self.source_dir / "configs" / "config.yaml").write_text(
+            'Pipeline:\n    tts_processor: "IrodoriTTSService"\n    stt_processor: "SpeechCppSTTService"\n',
+            encoding="utf-8",
+        )
+
+    def test_start_and_restart_start_speechcpp_asr_when_config_selects_it(self) -> None:
+        self.select_speechcpp_stt()
+        for command in ("start", "restart"):
+            result = self.run_manage(command)
+
+            with self.subTest(command=command):
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("systemctl start ace-speechcpp-asr.service", self.calls())
+                self.assertIn("curl -fsS http://127.0.0.1:8024/health", self.calls())
+                self.assertIn("speech.cpp ASR health check passed", result.stdout)
+
+    def test_start_leaves_speechcpp_asr_alone_with_riva(self) -> None:
+        result = self.run_manage("start")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("systemctl start ace-speechcpp-asr.service", self.calls())
+
+    def test_start_restores_workloads_and_fails_when_speechcpp_asr_health_times_out(self) -> None:
+        self.select_speechcpp_stt()
+
+        result = self.run_manage("start", SHIM_CURL_FAIL=":8024/health")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assert_workloads_restored(result)
+        self.assertIn("Timed out waiting for speech.cpp ASR health", result.stderr)
+
+    def test_stop_waits_for_the_sokutou_unit_before_containerd(self) -> None:
+        result = self.run_manage("stop", SHIM_LOADED_UNITS="ace-sokutou-tts.service")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        self.assertLess(
+            calls.index("systemctl stop ace-irodori-tts.service"),
+            calls.index("systemctl stop ace-sokutou-tts.service"),
+        )
+        self.assertLess(
+            calls.index("systemctl stop ace-sokutou-tts.service"),
+            calls.index("systemctl stop nginx coturn kubelet containerd"),
+        )
+
+    def test_stop_skips_a_sokutou_unit_that_is_not_installed(self) -> None:
+        result = self.run_manage("stop")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("systemctl stop ace-sokutou-tts.service", self.calls())
+
+    def test_stop_stops_an_active_speechcpp_asr_unit(self) -> None:
+        result = self.run_manage("stop", SHIM_ACTIVE_UNITS="ace-speechcpp-asr.service")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("systemctl stop ace-speechcpp-asr.service", self.calls())
+
+        result = self.run_manage("stop")
+
+        self.assertNotIn("systemctl stop ace-speechcpp-asr.service", self.calls())
+
+    def select_english_speechcpp_stt(self) -> None:
+        (self.source_dir / "configs" / "config.yaml").write_text(
+            'Pipeline:\n    tts_processor: "IrodoriTTSService"\n    stt_processor: "SpeechCppSTTService"\n'
+            'SpeechCppSTTService:\n    # Qwen3-ASR\n    base_url: "http://10.209.1.12:8025/v1"\n'
+            '    language: "en"\n    prompt: ""\nTurnTaking:\n    language: "ja"\n',
+            encoding="utf-8",
+        )
+
+    def test_start_uses_the_english_asr_unit_when_config_listens_in_english(self) -> None:
+        # Haas, the Japanese unit's model, refuses language=en.
+        self.select_english_speechcpp_stt()
+
+        result = self.run_manage("start", SHIM_ACTIVE_UNITS="ace-speechcpp-asr.service")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("systemctl start ace-speechcpp-asr-en.service", self.calls())
+        self.assertIn("curl -fsS http://127.0.0.1:8025/health", self.calls())
+        self.assertNotIn("systemctl start ace-speechcpp-asr.service", self.calls())
+        # The Japanese unit would hold GPU memory for nothing.
+        self.assertIn("systemctl stop ace-speechcpp-asr.service", self.calls())
+
+    def test_start_uses_the_japanese_asr_unit_and_stops_the_english_one(self) -> None:
+        self.select_speechcpp_stt()
+
+        result = self.run_manage("start", SHIM_ACTIVE_UNITS="ace-speechcpp-asr-en.service")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("systemctl start ace-speechcpp-asr.service", self.calls())
+        self.assertIn("systemctl stop ace-speechcpp-asr-en.service", self.calls())
+        self.assertNotIn("systemctl start ace-speechcpp-asr-en.service", self.calls())
+
+    def test_stop_stops_both_active_speechcpp_asr_units(self) -> None:
+        result = self.run_manage("stop", SHIM_ACTIVE_UNITS="ace-speechcpp-asr.service ace-speechcpp-asr-en.service")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("systemctl stop ace-speechcpp-asr.service", self.calls())
+        self.assertIn("systemctl stop ace-speechcpp-asr-en.service", self.calls())
+
+    def test_status_reports_the_english_asr_health_in_english_mode(self) -> None:
+        self.select_english_speechcpp_stt()
+
+        result = self.run_manage("status", SHIM_CURL_FAIL=":8025/health")
+
+        self.assertIn("speech.cpp ASR health check failed: http://127.0.0.1:8025/health", result.stderr)
+
+    def test_status_reports_speechcpp_asr_health_when_selected(self) -> None:
+        self.select_speechcpp_stt()
+
+        result = self.run_manage("status", SHIM_CURL_FAIL=":8024/health")
+
+        self.assertIn("speech.cpp ASR health check failed: http://127.0.0.1:8024/health", result.stderr)
+
+        result = self.run_manage("status")
+
+        self.assertIn("speech.cpp ASR health: ok (http://127.0.0.1:8024/health)", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()

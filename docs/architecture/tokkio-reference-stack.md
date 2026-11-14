@@ -37,8 +37,8 @@ NVIDIA 公式ドキュメントで押さえるべき主な前提は以下です�
   - UI/API/Grafana/Kubernetes の簡易疎通確認
 - `docs/architecture`
   - Tokkio を主系にした運用メモ
-- `infra/compose`, `services/orchestrator`, `unreal`
-  - Tokkio 非採用時の Unreal 直結研究用。Tokkio の主経路ではない
+- `infra/local_avatar`
+  - Tokkio を使わないローカル経路。Unreal 直結の研究用サンドボックスは 2026-11-14 に削除した
 
 ## Persistent Storage
 

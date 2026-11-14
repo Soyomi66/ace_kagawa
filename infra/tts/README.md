@@ -4,7 +4,7 @@
 
 ## モデル
 
-既定は `Aratako/Irodori-TTS-v4.1-Small`（MIT）です。`IRODORI_TTS_HF_CHECKPOINT` で差し替えます。 合成には既定で speech.cpp 版を使います（後述）。checkpoint の切り替えは PyTorch 版（`IRODORI_TTS_BACKEND=python`）での話です。
+既定は `Aratako/Irodori-TTS-v4.1-Small`（MIT）です。`IRODORI_TTS_HF_CHECKPOINT` で差し替えます。合成には 2026-11-11 から sokutou を使います（後述）。checkpoint の切り替えは PyTorch 版（`IRODORI_TTS_BACKEND=python`）での話です。
 
 | checkpoint | 用途 | 備考 |
 | --- | --- | --- |
@@ -32,9 +32,69 @@ v4.1-Small / MF は香川先生の参照音声で「はい。」のような短�
 
 推定モーラ数はかな 1、漢字 1.7、数字 1.5、英大文字は文字名の長さ（`W`・`X` 4、`H`・`R`・`Z` 3、その他 2）、英小文字 1、文中の句読点 2 で数えます。中・長文では上限が予測尺より長いので効きません。`IRODORI_TTS_DURATION_CAP_MORA_PER_SECOND=0` で無効になります。
 
-## speech.cpp で合成する（既定、2026-10-16〜）
+## sokutou で合成する（既定、2026-11-11〜）
 
-unit は `IRODORI_TTS_BACKEND=speechcpp` で、合成だけを [speech.cpp](https://github.com/nyosegawa/speech.cpp) v0.8.7 の常駐 worker（Vulkan、F16）に任せます。HTTP の応答形式、読みの正規化、短文キャッシュ、固定挨拶、後処理（16 kHz・トリム・フェード）は PyTorch 版と同じです。モデルは同じ v4.1-Small です。
+unit は `IRODORI_TTS_BACKEND=sokutou` で、合成だけを [sokutou](https://github.com/kosuketut/sokutou) の音声サーバーに HTTP で任せます。sokutou は同じ v4.1-Small を CUDA Graph と BF16 の DiT で速くしたもので、`ace-sokutou-tts.service` が docker コンテナとして動かします。読みの正規化、絵文字、短文の尺上限、短文キャッシュ、固定挨拶、後処理（16 kHz・トリム・フェード）は speech.cpp 版と同じです。
+
+2026-11-11 に GPU 0 をほかと共有せずに比べた結果です（12 steps どうし、`docs/audits/tts-sokutou-2026-11-11.md`）。
+
+| | speech.cpp 版（caption＋😊） | sokutou（😊） |
+| --- | ---: | ---: |
+| 1 文の合成（中央値、16 字以下の短い文） | 0.117 秒 | 0.038 秒 |
+| 1 文の合成（中央値、長い文） | 0.189 秒 | 0.106 秒 |
+| GPU メモリ | 2.5 GB | 12.4 GB |
+| caption | 使える | 使えない |
+
+本人らしさと読みには、エンジンによる差がありませんでした。同じ seed で作った sokutou と公式 fp32 版の波形は、相関の中央値が 0.999 です。
+
+2 つの unit の関係:
+
+- install スクリプトは、backend が sokutou のときだけ `ace-sokutou-tts.service` を enable します（`WantedBy=ace-irodori-tts.service`）。そのため `ace-irodori-tts.service` を起動すると sokutou も起動します。ほかの backend では disable するので、unit の backend の行を変えるだけでエンジンが切り替わります。
+- `ace-irodori-tts.service` が止まっても落ちても、sokutou は動き続け、準備が済んだままです。止める操作を sokutou に伝えると、サービスが落ちたときにも sokutou が冷えた状態から立ち上がり直します（2026-11-12 の確認で復帰まで 43 秒）。負荷が高く sokutou の準備が 100 秒を超えると、サービスの起動失敗と sokutou の立ち上げ直しが繰り返されるので、伝えないことにしました。
+- 止めるときは 2 つとも止めます。`manage_tokkio.sh stop` は、サービス、sokutou、containerd の順に止め、GPU 0 の約 13 GB を空けます。手で止めるときは `sudo systemctl stop ace-irodori-tts.service ace-sokutou-tts.service` です。
+- コンテナは `127.0.0.1:8026` だけで待ち受けます。最初の要求（起動時の短文キャッシュ作り）は、sokutou の `/health` が 200 を返すまで最大 100 秒待ちます。2026-11-11 の確認では、コンテナの起動から準備完了まで 37 秒でした。
+- 準備ができたら `/v1/engine` の steps を確かめ、`IRODORI_TTS_NUM_STEPS` と違えばエラーにします。sokutou の steps はコンテナの起動時に決まる（`SOKUTOU_TTS_NUM_STEPS`）ので、2 つの unit を同じ値にします。install スクリプトも、違う値を拒否します。
+
+| 環境変数 | 値（unit） | 意味 |
+| --- | --- | --- |
+| `IRODORI_TTS_SOKUTOU_URL` | `http://127.0.0.1:8026` | sokutou の URL |
+| `IRODORI_TTS_SOKUTOU_STARTUP_TIMEOUT_SECONDS` | 100（既定） | 準備完了を待つ時間。`manage_tokkio.sh` はサービス全体を 120 秒待つ |
+| `IRODORI_TTS_SOKUTOU_TIMEOUT_SECONDS` | 60（既定） | 1 回の合成を待つ時間 |
+| `SOKUTOU_TTS_IMAGE` | `ace-kagawa/sokutou-server:68b871c` | 下のコマンドで作るイメージ |
+| `SOKUTOU_TTS_GPU_UUID` | `GPU-d4c17c05-…` | nvidia-smi の GPU 0（`docker run --gpus device=`） |
+| `SOKUTOU_TTS_NUM_STEPS` | 12 | `IRODORI_TTS_NUM_STEPS` と同じ値 |
+| `SOKUTOU_TTS_REFERENCE_WAV` | サービスと同じ参照 WAV | コンテナの `/voices/kagawa/ref.wav` に読み取り専用でつなぐ |
+| `SOKUTOU_TTS_HF_HOME` | `/data/ACE/irodori/hf-cache` | 読み取り専用・オフライン。起動時に何も取得しない |
+
+注意点:
+
+- **caption は使えない**。sokutou は caption を読まないので、unit から外しました。`IRODORI_TTS_CAPTION` を設定すると、サービスは起動しません。LoRA も同じです。
+- **sokutou が文末に足す「。」は外す**。sokutou の `server.py` は、「。」などで終わらない文に「。」を足します。このサービスは返答を「、」や 64 字で区切って送るので、そのままでは「私は複合材料、。」となり、語尾に「を」が付きました（30 本中 5 本）。`sokutou_entry.py` がこの「。」だけを外し、speech.cpp と同じ文を渡します。sokutou 側で直したら、この入口は要りません。
+- **seed は送らない**。speech.cpp と同じく、毎回違う音声になります。
+- **長すぎる音声は 1 回だけ作り直す**。sokutou は、文字数に比べて長すぎる音声を 500 で返します。そのときは、もう一度合成します。2 回続いたらエラーにします。sokutou が文を拒否したとき（200 字を超えたときなど）は、このサービスも 400 を返します。
+- **透かしは付かない**。sokutou が起動時に外します。`/healthz` の `watermark` は `false` で、`sokutou_url`・`sokutou_num_steps` に接続先と steps が出ます。
+- **GPU 0 に収まるかは未確認**。GPU 0 には vLLM・Riva・A2F も載ります。Tokkio の稼働中に 12.4 GB が収まるかは、最初の `manage_tokkio.sh start` で `nvidia-smi` を見て確かめてください。
+- コンテナのログは `journalctl -u ace-sokutou-tts.service` に出ます。コンテナが落ちると、その直後の要求は 500 になります。systemd がコンテナを起動し直し、次の要求は準備ができるまで待ちます（2026-11-12 の確認で 39 秒）。
+- **docker が要る**。コンテナは containerd を通して動くので、`manage_tokkio.sh stop` で containerd が止まっている間は sokutou を起動できません。`manage_tokkio.sh start` は containerd を先に起動するので、そのまま動きます。
+- **200 字を超える文は 400 になる**。sokutou は、絵文字を含めて 200 字を超える文を受け付けません。speech.cpp は受け付けていました。Tokkio からの文は区切ってあるので、通常は届きません。
+
+イメージは sokutou の clone から作ります（2026-11-11 の比較で使ったイメージと同じ手順）。
+
+```bash
+cd <sokutou の clone> && git checkout 68b871c
+tar -c docker/Dockerfile server/*.py engine/*.py \
+  | docker build -f docker/Dockerfile --target server --build-arg SOKUTOU_REVISION=68b871c \
+      -t ace-kagawa/sokutou-server:68b871c -
+```
+
+speech.cpp に戻すには、次の 2 つを行います。
+
+1. `ace-irodori-tts.service` を `IRODORI_TTS_BACKEND=speechcpp` にし、コメントにした `IRODORI_TTS_SPEECHCPP_*` と `IRODORI_TTS_CAPTION` の行を戻す。
+2. `infra/tts/install_irodori_tts_service.sh --restart` を実行する。スクリプトが sokutou を disable し、稼働中なら止めます。
+
+## speech.cpp で合成する（2026-10-16〜11-11 の既定）
+
+`IRODORI_TTS_BACKEND=speechcpp` にすると、合成だけを [speech.cpp](https://github.com/nyosegawa/speech.cpp) v0.8.7 の常駐 worker（Vulkan、F16）に任せます。HTTP の応答形式、読みの正規化、短文キャッシュ、固定挨拶、後処理（16 kHz・トリム・フェード）は PyTorch 版と同じです。モデルは同じ v4.1-Small です。
 
 ### 12 steps（2026-10-17〜）
 
@@ -52,6 +112,38 @@ unit は `IRODORI_TTS_NUM_STEPS=12` で、checkpoint 既定の 40 steps より�
 - 音声の長さは steps によらず同じ。速くなるのは同じ長さの音声を少ない計算で作るため。
 - 言い誤りの大半は「いいえ。」「ええ。」で、40 steps でも同じように崩れる（下の「短文は尺を固定する」）。
 - 固定挨拶の PCM はファイルなので、作り直さない限り 40 steps の音声のまま。短文キャッシュはメモリ上だけなので、起動時に 12 steps で作り直される。
+- sokutou も 12 steps で動かす（`SOKUTOU_TTS_NUM_STEPS`）。
+
+### 話し方の指示（caption、2026-10-17〜11-11）
+
+参照音声が原稿の読み上げなので、そのままでは応答も読み上げ調になります。そこで unit の `IRODORI_TTS_CAPTION` に「落ち着いた大学の学長が、目の前の相手と気さくに会話している。自然な間と抑揚があり、気持ちがこもっている。」を設定し、speech.cpp には `instructions` として渡していました（PyTorch 版では `caption`）。2026-10-17 に 9 構成を聞き比べて決めました（`docs/audits/tts-expressiveness-2026-10-17.md`）。sokutou は caption を読まないので、2026-11-11 に sokutou へ切り替えたときに外しました。
+
+| | caption なし | caption あり |
+| --- | ---: | ---: |
+| 音高の揺れ（4 秒窓の標準偏差、8 文 × 3 seed） | 2.49 半音 | 2.81 半音（同じ文・seed の 20 組中 16 組で増加） |
+| 本人らしさ（CAMPPlus、現行参照との cosine） | 0.697 | 0.695 |
+| 最初の音声まで（中央値、GPU 1 で描画と共有） | 0.482 秒 | 0.529 秒 |
+
+- steps は抑揚に関係しません（40・16・12 steps で同じ）。
+- caption は CFG の分岐を 1 つ増やすので、合成が少し遅くなります。
+- `/healthz` の `caption` に使用中の caption が出ます。空にすると caption なしに戻ります。
+- 固定挨拶の PCM（「皆さん、こんにちは」）は caption なしで作ったファイルのままです。
+
+### caption の強さと絵文字（2026-10-18 追加、既定はオフ）
+
+caption を入れても「ロボットのよう」だったので、次の設定を足しました。聞き比べ（`docs/audits/tts-emotion-2026-10-18.md`）の結果、2026-10-19 に unit へ `IRODORI_TTS_STYLE_EMOJI=😊` だけを入れました（構成 D。残念な話の文も 😊 のまま）。
+
+| 環境変数 | 渡し先 | 内容 |
+| --- | --- | --- |
+| `IRODORI_TTS_CAPTION_CFG_SCALE` | speech.cpp `cfg_scale_instructions` / PyTorch `cfg_scale_caption` | caption への寄せ方。未設定で 3。`IRODORI_TTS_CAPTION` なしでは起動を拒否します（speech.cpp が効かない設定を拒否するため） |
+| `IRODORI_TTS_STYLE_EMOJI` | 文頭 | 全文の頭に付ける絵文字。例: 😊（楽しげ） |
+| `IRODORI_TTS_SYMPATHY_EMOJI` | 文頭 | 残念・申し訳・すみません・終了・中止・できません などを含む文だけ、上の代わりに付ける絵文字。例: 🫶（優しく） |
+
+- 絵文字は正規化の後に付けます。「ありがとうございました。」のように固定の正規化で形が変わる文も、そのまま通ります。短文の尺上限・短文キャッシュのキーは絵文字なしの文で決まります。
+- Irodori が話し方の指示として読む絵文字は `Irodori-TTS/irodori_tts/gradio_emoji_palette.py` に一覧があります。🤭（笑い）・😮‍💨（ため息）のような音を出すものは避けてください。文字（読める文字）を設定すると起動を拒否します。
+- 字幕（Tokkio の `TTSTextFrame`）には出ません。LLM には出させません（system prompt で絵文字を禁止しているため）。
+- `/healthz` の `caption_cfg_scale`・`style_emoji`・`sympathy_emoji` に使用中の値が出ます。
+- 遅延は変わりません（GPU 1 で最初の音声まで 0.52〜0.54 秒、caption のみと同じ）。
 
 ### PyTorch 版との比較と設定（2026-10-16、40 steps の時点）
 
@@ -93,6 +185,8 @@ infra/tts/install_irodori_tts_service.sh --restart  # 稼働中のサービス�
 
 `--restart` を付けない場合、稼働中のサービスは次の起動まで古い設定のままです。
 
+unit が `IRODORI_TTS_BACKEND=sokutou` のとき、スクリプトは `ace-sokutou-tts.service` も入れて enable します。その前に、イメージがあること、2 つの unit の steps と参照 WAV が同じことを確かめます。`--restart` では、sokutou を先に再起動してからサービスを再起動します。ほかの backend では sokutou を disable し、`--restart` なら稼働中の sokutou も止めます。
+
 ## Irodori-TTS 本体の更新
 
 ```bash
@@ -112,6 +206,8 @@ v4 系のコードは `transformers>=5.12.1` を要求します。`uv sync` は 
 - 小数: `1.5倍`→いってんご倍、`8.5`→はってんご（`6.5`→ろくてんご）。`v4.1`→vよんてんいち
 - 大きな数: `10兆円`→じゅっちょう円、`90京`→きゅうじゅうけい（`京都` などは対象外）
 - 固有の読み: `1つ`→ひとつ、`20歳`→はたち、`1泊2日`→いっぱくふつか
+- 4 桁の年は漢数字で渡します: `1952年9月19日`→千九百五十二年くがつじゅうくにち、`2026年度`→二千二十六年度、`1970年代`→千九百七十年代（`2026/4/1`・`2026-07-19` も同じ）。かなの「せんきゅうひゃく…」はモデルが言い崩れるため（2026-10-17 の実測で Qwen3-ASR の聞き取りが 148 回中 8 回崩れ、漢数字は 105 回中 0 回）。3 桁以下の年（`昭和27年`）、`年間`・`年目`、金額（`1980円`）はかなのままです
+- 年代・年齢層: `60代`→ろくじゅうだい、`70歳代`→ななじゅっさいだい、`20歳代`→にじゅっさいだい（はたちは年齢そのものだけ）、`90年代`→きゅうじゅうねんだい。`代表`・`代金` などの語は対象外
 - 時刻: `09:05`→くじごふん（先頭の 0 は読まない）、`10:00〜12:00まで`→じゅうじからじゅうにじまで（「まで」を重ねない）。`質問1：10月` のように見出し語（質問・ポイント・ステップ・問題など）の後のコロンは区切りとして読みます
 - 序数: 数字の前の `第` は「だい」とかなで書きます（`第1月曜日`→だいいち月曜日。「第いち」と混ぜるとモデルが言い崩れるため。2026-10-08 の試聴で 1/3 → 3/3）
 - 日付: `4/1（火）`、`2026/4/1`、`2026-07-19`、`4月1日`。`19日`/`29日`→じゅうくにち/にじゅうくにち。月の後の「ついたち」は `はちがつ ついたち` と空白を入れます（つが続くとモデルが言いよどむため。2026-10-08 の試聴で 8/12 → 6/6）。月を伴わない `1日` は「いちにち」、ただし `1日（土）` や `今月の1日` は「ついたち」

@@ -29,7 +29,7 @@ Tokkio（Kubernetes・VST・SDR・Animation Graph）を使わずに、香川先�
 前提: Tokkio は停止中（renderer の GPU と TTS を共有するため同時に動かさない）、containerd・LLM・TTS は起動済み。
 
 ```bash
-docker start ace-vllm-llama31-swallow-8b        # LLM（未起動なら）
+docker start ace-vllm-llama31-swallow-8b        # LLM（未起動なら。Gemma 4 に切り替えた後は ace-vllm-gemma4-12b）
 sudo systemctl start ace-irodori-tts             # TTS（未起動なら）
 infra/local_avatar/local_avatar.sh start         # A2F・シグナリング・中継・renderer・会話サーバー
 infra/local_avatar/local_avatar.sh status

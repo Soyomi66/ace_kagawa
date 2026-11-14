@@ -8,6 +8,8 @@ import types
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_ASR_MODEL = "conformer-unified-ja-JP-asr-streaming-asr-bls-ensemble"
@@ -68,6 +70,51 @@ def load_module(name: str, path: Path):
 
 prepare = load_module("prepare_tokkio_workspace", ROOT / "infra" / "tokkio" / "prepare_tokkio_workspace.py")
 customize = load_module("customize_tokkio_japanese", ROOT / "infra" / "tokkio" / "customize_tokkio_japanese.py")
+# The upstream bot.py lines that apply_patch rewrites.
+UPSTREAM_BOT_FIXTURE = (
+    "# from pipecat.audio.vad.silero import SileroVADAnalyzer"
+    + customize.OLD_VAD_IMPORT_SNIPPET
+    + customize.OLD_VAD_SNIPPET
+    + customize.OLD_LLM_SNIPPET
+    + "\n"
+    + customize.OLD_BOT_SNIPPET
+    + customize.OLD_CONTEXT_AGGREGATOR_SNIPPET
+    + customize.OLD_PIPELINE_STT_SNIPPET
+)
+
+
+def load_generated_config_model() -> types.ModuleType:
+    """Execute CONFIG_PY the way the controller imports src/config.py."""
+    import pydantic
+
+    animation_graph_module = types.ModuleType("nvidia_pipecat.services.animation_graph_service")
+
+    class AnimationGraphConfiguration(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(extra="allow")
+
+    animation_graph_module.AnimationGraphConfiguration = AnimationGraphConfiguration
+    module = types.ModuleType("generated_tokkio_config")
+    names = (
+        "nvidia_pipecat",
+        "nvidia_pipecat.services",
+        "nvidia_pipecat.services.animation_graph_service",
+        module.__name__,
+    )
+    previous = {name: sys.modules.get(name) for name in names}
+    sys.modules["nvidia_pipecat"] = types.ModuleType("nvidia_pipecat")
+    sys.modules["nvidia_pipecat.services"] = types.ModuleType("nvidia_pipecat.services")
+    sys.modules["nvidia_pipecat.services.animation_graph_service"] = animation_graph_module
+    # pydantic resolves postponed annotations through sys.modules[cls.__module__].
+    sys.modules[module.__name__] = module
+    try:
+        exec(compile(customize.CONFIG_PY, "config.py", "exec"), module.__dict__)
+        return module
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
 
 
 def install_stub_module(name: str) -> types.ModuleType:
@@ -170,6 +217,7 @@ def load_tokkio_rag_with_stubs():
     package.__path__ = []
     sys.modules["tokkio_rag_router_test_pkg.tokkio_llm"] = tokkio_llm
     load_module("tokkio_rag_router_test_pkg.local_rag", ROOT / "infra" / "rag" / "local_rag.py")
+    load_module("tokkio_rag_router_test_pkg.tokkio_web_search", ROOT / "infra" / "tokkio" / "tokkio_web_search.py")
     return load_module("tokkio_rag_router_test_pkg.tokkio_rag", ROOT / "infra" / "tokkio" / "tokkio_rag.py")
 
 
@@ -202,6 +250,67 @@ class TokkioLlmConfigTests(unittest.TestCase):
             },
         )
         self.assertEqual(tokkio_llm.nvidia_model_input_params("mistralai/mistral-nemotron"), {})
+
+    def test_gemma4_uses_the_evaluated_sampling_without_thinking(self) -> None:
+        tokkio_llm = load_tokkio_llm_with_stubs()
+
+        for model in (
+            "gemma-4-12b-it",
+            "google/gemma-4-12b-it",
+            " Gemma-4-E4B-it ",
+            "gemma-4-26b-a4b-it",
+            "google/gemma-4-26B-A4B-it",
+        ):
+            with self.subTest(model=model):
+                params = tokkio_llm.nvidia_model_input_params(model)
+
+                self.assertEqual(params["temperature"], 0.1)
+                self.assertEqual(params["top_p"], 0.95)
+                self.assertEqual(params["max_tokens"], 512)
+                self.assertEqual(
+                    params["extra"],
+                    {
+                        "extra_body": {
+                            "top_k": 64,
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        }
+                    },
+                )
+
+    def test_swallow_keeps_the_server_default_sampling(self) -> None:
+        tokkio_llm = load_tokkio_llm_with_stubs()
+
+        self.assertEqual(tokkio_llm.nvidia_model_input_params("llama-3.1-swallow-8b-instruct-v0.5"), {})
+
+    def test_rag_router_built_like_bot_py_sends_the_gemma4_sampling(self) -> None:
+        # bot.py passes no params= and gives the router the RAG server's max_tokens (64);
+        # the LLM request must still get the Gemma 4 sampling.
+        tokkio_rag = load_tokkio_rag_with_stubs()
+        base_service = sys.modules["pipecat.services.openai.llm"].OpenAILLMService
+
+        def capture_init(self, **kwargs):
+            self.init_kwargs = kwargs
+
+        base_service.__init__ = capture_init
+        base_service.InputParams = staticmethod(lambda **params: params)
+
+        router = tokkio_rag.TokkioNvidiaLLMRAGRouterService(
+            api_key="local-key",
+            base_url="http://10.209.1.12:8011/v1",
+            model="gemma-4-12b-it",
+            collection_name="ace_kagawa",
+            max_tokens=64,
+            provider="nvidia",
+            route_keywords=["研究"],
+            filler=["確認しています"],
+            time_delay=8.0,
+        )
+
+        params = router.init_kwargs["params"]
+        self.assertEqual(params["temperature"], 0.1)
+        self.assertEqual(params["max_tokens"], 512)
+        self.assertEqual(params["extra"]["extra_body"]["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(router.max_tokens, 64)
 
     def test_generated_env_exports_llm_api_key_for_local_endpoint(self) -> None:
         generated = prepare.build_generated_env(
@@ -351,8 +460,8 @@ class TokkioLlmConfigTests(unittest.TestCase):
         self.assertIn("100文字以内", yaml_text)
         self.assertIn("最大2文", yaml_text)
         self.assertNotIn("80文字以内", yaml_text)
-        self.assertIn("time_delay: 2.5", yaml_text)
-        self.assertIn('- "確認しています"', yaml_text)
+        self.assertIn("time_delay: 1.0", yaml_text)
+        self.assertIn('- "そうですね。"', yaml_text)
         self.assertNotIn("少々お待ちください", yaml_text)
         self.assertIn('llm_processor: "NvidiaLLMService"', yaml_text)
 
@@ -406,7 +515,14 @@ class TokkioLlmConfigTests(unittest.TestCase):
         )[1]
 
         self.assertIn("GROUNDED_ANSWER_UNAVAILABLE_REPLY", source)
-        self.assertEqual(local_rag_block.count("await self._push_grounded_answer_unavailable()"), 2)
+        # An empty prompt context still gets the fixed reply.
+        self.assertEqual(local_rag_block.count("await self._push_grounded_answer_unavailable()"), 1)
+        # Rejected evidence goes to the LLM, always with the note that says what not to make up.
+        self.assertIn(
+            "self._build_local_rag_context(context, ungrounded_prompt_note(assessment), query)",
+            local_rag_block,
+        )
+        # The visitor's turn never reaches the LLM bare, and a failed grounded path never reaches it.
         self.assertNotIn("await super()._process_context(context)", local_rag_block)
         self.assertNotIn("await super()._process_context(context)", router_error_block)
         self.assertIn(
@@ -417,6 +533,85 @@ class TokkioLlmConfigTests(unittest.TestCase):
             "await self.push_frame(TTSSpeakFrame(GROUNDED_ANSWER_UNAVAILABLE_REPLY))",
             router_error_block,
         )
+
+    def test_rag_router_lets_the_llm_answer_rejected_questions_with_a_note(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        tokkio_rag = load_tokkio_rag_with_stubs()
+        local_rag = sys.modules["tokkio_rag_router_test_pkg.local_rag"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus_dir = Path(tmp) / "corpus"
+            corpus_dir.mkdir()
+            (corpus_dir / "kagawa.md").write_text(
+                "# Kagawa\n\n"
+                "## kaken_keywords\n\n"
+                "source_url: https://nrid.nii.ac.jp/example\n"
+                "source_priority: P1\n"
+                "record_type: kagawa_research_keywords\n"
+                "chunk_id: chunk_kagawa_kaken_keywords\n"
+                "keywords: 複合材料, CMC, SiC/SiC\n\n"
+                "香川豊先生の研究分野は、複合材料、セラミックス基複合材料（CMC）、界面力学特性です。\n",
+                encoding="utf-8",
+            )
+            db_path = Path(tmp) / "local_rag.sqlite"
+            local_rag.build_index(corpus_dir, db_path)
+
+            router = object.__new__(tokkio_rag.TokkioNvidiaLLMRAGRouterService)
+            router.provider = "local"
+            router.local_db_path = str(db_path)
+            router.local_top_k = 3
+            router.local_max_context_chars = 2800
+            router.enable_citations = False
+            router.fallback_to_llm_on_error = False
+            router.route_keywords = tuple(customize.DEFAULT_RAG_ROUTE_KEYWORDS)
+            pushed: list = []
+            sent_to_llm: list = []
+
+            async def noop(*_args, **_kwargs) -> None:
+                return None
+
+            async def push_frame(frame, *_args) -> None:
+                pushed.append(frame)
+
+            async def direct_llm(_self, context) -> None:
+                sent_to_llm.append(context.get_messages()[-1]["content"])
+
+            router.start_ttfb_metrics = noop
+            router.stop_ttfb_metrics = noop
+            router.push_error = noop
+            router.push_frame = push_frame
+
+            def run(text: str) -> None:
+                pushed.clear()
+                sent_to_llm.clear()
+                turn = [{"role": "user", "content": text}]
+                context = types.SimpleNamespace(get_messages=lambda: turn)
+                with mock.patch.object(tokkio_rag, "_push_local_reply_if_available", return_value=False), \
+                        mock.patch.object(tokkio_rag.TokkioNvidiaLLMService, "_process_context", direct_llm, create=True):
+                    asyncio.run(router._process_context(context))
+
+            # The corpus says nothing about his hobbies: no fixed sentence, the LLM answers
+            # with the note for questions about Kagawa himself.
+            run("香川先生の趣味は何ですか")
+            self.assertEqual(pushed, [])
+            self.assertEqual(len(sent_to_llm), 1)
+            self.assertTrue(sent_to_llm[0].startswith(local_rag.UNGROUNDED_SELF_PROMPT_NOTE))
+            self.assertTrue(sent_to_llm[0].endswith("香川先生の趣味は何ですか"))
+
+            run("香川先生と山田先生の研究について教えてください")
+            self.assertEqual(pushed, [])
+            self.assertIn("「山田」という方", sent_to_llm[0])
+
+            # A broken index is not answered from the LLM's own knowledge.
+            router.local_db_path = str(Path(tmp) / "missing.sqlite")
+            run("香川先生の趣味は何ですか")
+            self.assertEqual(sent_to_llm, [])
+            self.assertEqual(
+                [frame.content for frame in pushed if getattr(frame, "content", "")],
+                [tokkio_rag.GROUNDED_ANSWER_UNAVAILABLE_REPLY],
+            )
 
     def test_rag_router_sends_generic_topics_outside_the_corpus_to_direct_llm(self) -> None:
         tokkio_rag = load_tokkio_rag_with_stubs()
@@ -464,7 +659,7 @@ class TokkioLlmConfigTests(unittest.TestCase):
             # Generic wording whose topic the corpus does cover stays grounded.
             self.assertTrue(routes_to_rag("セラミックスの研究について教えてください"))
             # Questions addressed to Kagawa stay on the grounded path even when unanswerable,
-            # so they get the fixed "cannot confirm" reply instead of an ungrounded LLM answer.
+            # so the LLM answers them with the note that forbids inventing his private facts.
             self.assertTrue(routes_to_rag("香川先生の趣味は何ですか"))
             self.assertTrue(routes_to_rag("あなたの研究について教えてください"))
 
@@ -472,11 +667,281 @@ class TokkioLlmConfigTests(unittest.TestCase):
             router.local_db_path = str(Path(tmp) / "missing.sqlite")
             self.assertTrue(routes_to_rag("量子コンピュータの研究について教えてください"))
 
+    def test_rag_router_asks_again_on_garbled_turns_and_notes_university_life_topics(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        tokkio_rag = load_tokkio_rag_with_stubs()
+        router = object.__new__(tokkio_rag.TokkioNvidiaLLMRAGRouterService)
+        router.provider = "nvidia"  # skip the corpus check; only the classifier routes
+        router.route_keywords = tuple(customize.DEFAULT_RAG_ROUTE_KEYWORDS)
+        pushed: list = []
+        sent_to_llm: list = []
+
+        async def noop() -> None:
+            return None
+
+        async def push_frame(frame, *_args) -> None:
+            pushed.append(frame)
+
+        async def direct_llm(_self, context) -> None:
+            sent_to_llm.append(context.get_messages()[-1]["content"])
+
+        router.start_ttfb_metrics = noop
+        router.stop_ttfb_metrics = noop
+        router.push_frame = push_frame
+
+        def run(text: str) -> None:
+            pushed.clear()
+            sent_to_llm.clear()
+            turn = [{"role": "user", "content": text}]
+            context = types.SimpleNamespace(get_messages=lambda: turn)
+            with mock.patch.object(tokkio_rag, "_push_local_reply_if_available", return_value=False), \
+                    mock.patch.object(tokkio_rag.TokkioNvidiaLLMService, "_process_context", direct_llm, create=True):
+                asyncio.run(router._process_context(context))
+
+        run("千五百一二百話")
+        texts = [frame.content for frame in pushed if getattr(frame, "content", "")]
+        self.assertEqual(texts, [tokkio_rag.ASK_AGAIN_REPLY])
+        self.assertEqual(sent_to_llm, [])
+
+        run("学食はおいしいですか")
+        self.assertEqual(len(sent_to_llm), 1)
+        self.assertTrue(sent_to_llm[0].startswith(tokkio_rag.OUTSIDE_CORPUS_PROMPT_NOTE))
+
+        run("今日の天気は")
+        self.assertEqual(sent_to_llm, ["今日の天気は"])
+
+        # A question that mentions the campus gets the note as well: no made-up shops or hours.
+        run("大学の近くにコンビニはありますか")
+        self.assertTrue(sent_to_llm[0].startswith(tokkio_rag.OUTSIDE_CORPUS_PROMPT_NOTE))
+        run("おすすめの本を教えてください")
+        self.assertEqual(sent_to_llm, ["おすすめの本を教えてください"])
+
+    def test_web_search_query_sends_general_questions_only(self) -> None:
+        load_tokkio_rag_with_stubs()
+        web = sys.modules["tokkio_rag_router_test_pkg.tokkio_web_search"]
+
+        sent = {
+            "えっと、今日の天気を教えてください": "八王子 今日の天気",
+            "蒲田の天気はどうですか": "蒲田の天気はどう",
+            "セラミックス基複合材料とは何ですか": "セラミックス基複合材料とは",
+            "AIとは何ですか": "AIとは",
+            "量子コンピュータについて教えてください": "量子コンピュータとは",
+            "2025年のノーベル化学賞は誰ですか": "2025年のノーベル化学賞は誰",
+            "富士山の高さはどのくらいですか": "富士山の高さはどのくらい",
+        }
+        for text, query in sent.items():
+            with self.subTest(text=text):
+                self.assertEqual(web.web_search_query(text), query)
+        # The router marks topics outside the corpus; those need no question pattern.
+        self.assertIsNone(web.web_search_query("学食はおいしいですか"))
+        self.assertEqual(web.web_search_query("学食はおいしいですか", topic_outside_corpus=True), "学食はおいしい")
+        self.assertEqual(web.web_search_query("学食はありますか", topic_outside_corpus=True), "学食")
+        self.assertEqual(
+            web.web_search_query("学食はありますか", topic_outside_corpus=True, about_university=True),
+            "東京工科大学 学食",
+        )
+        # The excerpts are not this university's documents: other universities' numbers are not ours.
+        self.assertIn("他の大学や他の施設の数値や事実を、東京工科大学や私のこととして答えず", web.WEB_SEARCH_PROMPT_NOTE)
+        for text in (
+            # The persona, named people, personal details.
+            "あなたの趣味は何ですか",
+            "香川先生の経歴を教えてください",
+            "山田さんはどこにいますか",
+            "佐藤教授の研究室はどこですか",
+            "私の電話番号は09012345678です",
+            "090-1234-5678に天気を教えてください",
+            "０９０ １２３４ ５６７８の天気はどうですか",
+            "娘の学校の天気はどうですか",
+            # Questions to the persona without a subject.
+            "趣味は何ですか",
+            "どこの出身ですか",
+            "好きな食べ物は何ですか",
+            "名前は?",
+            # Back-channels, requests, follow-ups that point back.
+            "そうなんですか",
+            "聞こえますか",
+            # ことは is not とは: this asks about the persona's experience.
+            "ChatGPTを使ったことはありますか",
+            "ちょっと待ってください",
+            "もう少し詳しく教えてください",
+            "それはいつですか",
+            "その研究はいつ始まりましたか",
+            "こんにちは",
+            "ありがとうございました",
+            "はい、お願いします",
+            "なるほど",
+            # English mode stays local.
+            "What is AI?",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(web.web_search_query(text))
+        # The persona and personal-detail checks hold even for topics outside the corpus.
+        for text in ("あなたは寮に住んでいましたか", "山田さんは学食に行きますか", "私の住所は寮です"):
+            with self.subTest(text=text):
+                self.assertIsNone(web.web_search_query(text, topic_outside_corpus=True))
+
+    def test_search_breaker_pauses_after_consecutive_failures(self) -> None:
+        load_tokkio_rag_with_stubs()
+        web = sys.modules["tokkio_rag_router_test_pkg.tokkio_web_search"]
+        breaker = web.SearchBreaker(max_failures=2, pause_s=300.0)
+
+        breaker.record(False, 0.0)
+        self.assertFalse(breaker.is_open(1.0))
+        breaker.record(True, 1.0)
+        breaker.record(False, 2.0)
+        self.assertFalse(breaker.is_open(3.0))
+        breaker.record(False, 3.0)
+        self.assertTrue(breaker.is_open(4.0))
+        self.assertFalse(breaker.is_open(303.1))
+
+    def test_exa_search_sends_lite_japan_request_and_keeps_highlights(self) -> None:
+        import asyncio
+
+        load_tokkio_rag_with_stubs()
+        web = sys.modules["tokkio_rag_router_test_pkg.tokkio_web_search"]
+        calls = []
+
+        async def fake_post(url, body, headers, timeout_s):
+            calls.append((url, body, headers, timeout_s))
+            return {
+                "results": [
+                    {"title": "就職状況", "url": "https://example.invalid/a", "publishedDate": "2026-07-24T00:00:00.000Z",
+                     "highlights": ["就職率 98.1%", "  "]},
+                    {"title": "空", "url": "https://example.invalid/b", "highlights": []},
+                ]
+            }
+
+        searcher = web.ExaWebSearch("test-key", timeout_s=2.0, post_json=fake_post)
+        results = asyncio.run(searcher.search("東京工科大学 就職率"))
+
+        url, body, headers, timeout_s = calls[0]
+        self.assertEqual(url, "https://api.exa.ai/search")
+        self.assertEqual(body["type"], "lite")
+        self.assertEqual(body["userLocation"], "JP")
+        self.assertEqual(body["query"], "東京工科大学 就職率")
+        self.assertEqual(headers["x-api-key"], "test-key")
+        self.assertEqual(timeout_s, 2.0)
+        self.assertEqual([(r.title, r.published_date, r.text) for r in results], [("就職状況", "2026-07-24", "就職率 98.1%")])
+        prompt = web.format_web_results_for_prompt(results, today=__import__("datetime").date(2026, 11, 13))
+        self.assertTrue(prompt.startswith("参考情報: "))
+        self.assertIn("2026-11-13", prompt)
+        self.assertIn("[1] 就職状況: 就職率 98.1%", prompt)
+        self.assertNotIn("2026-07-24", prompt)
+        self.assertNotIn("example.invalid", prompt)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(web.ExaWebSearch.from_key_file(Path(tmp) / "missing"))
+            (Path(tmp) / "empty").write_text("\n", encoding="utf-8")
+            self.assertIsNone(web.ExaWebSearch.from_key_file(Path(tmp) / "empty"))
+
+    def test_rag_router_adds_web_results_for_general_questions_only(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        tokkio_rag = load_tokkio_rag_with_stubs()
+        web = sys.modules["tokkio_rag_router_test_pkg.tokkio_web_search"]
+        router = object.__new__(tokkio_rag.TokkioNvidiaLLMRAGRouterService)
+        router.provider = "nvidia"
+        router.route_keywords = tuple(customize.DEFAULT_RAG_ROUTE_KEYWORDS)
+        router.filler = []
+        router.time_delay = 1.0
+        queries = []
+
+        class FakeSearcher:
+            timeout_s = 2.0
+
+            async def search(self, query):
+                queries.append(query)
+                return [web.WebSearchResult("天気", "https://example.invalid", "", "八王子は晴れ、最高19度")]
+
+        router._cached_web_searcher = FakeSearcher()
+        web.SEARCH_BREAKER = web.SearchBreaker()
+        tokkio_rag.SEARCH_BREAKER = web.SEARCH_BREAKER
+        sent_to_llm = []
+
+        async def noop() -> None:
+            return None
+
+        async def push_frame(frame, *_args) -> None:
+            return None
+
+        async def direct_llm(_self, context) -> None:
+            sent_to_llm.append(context.get_messages()[-1]["content"])
+
+        router.start_ttfb_metrics = noop
+        router.stop_ttfb_metrics = noop
+        router.push_frame = push_frame
+
+        def run(text: str) -> str:
+            sent_to_llm.clear()
+            turn = [{"role": "user", "content": text}]
+            context = types.SimpleNamespace(get_messages=lambda: turn)
+            with mock.patch.object(tokkio_rag, "_push_local_reply_if_available", return_value=False), \
+                    mock.patch.object(tokkio_rag.TokkioNvidiaLLMService, "_process_context", direct_llm, create=True):
+                asyncio.run(router._process_context(context))
+            return sent_to_llm[0]
+
+        sent = run("今日の天気は")
+        self.assertEqual(queries, ["八王子 今日の天気"])
+        self.assertTrue(sent.startswith("参考情報: 以下はWeb検索"))
+        self.assertIn("八王子は晴れ、最高19度", sent)
+
+        queries.clear()
+        self.assertEqual(run("あなたの趣味は何ですか"), "あなたの趣味は何ですか")
+        self.assertEqual(queries, [])
+        # A campus question gets the outside-corpus note, but that alone sends nothing to the web.
+        self.assertTrue(run("大学の近くにコンビニはありますか").startswith(tokkio_rag.OUTSIDE_CORPUS_PROMPT_NOTE))
+        self.assertEqual(queries, [])
+
+        # University life is outside the corpus, so it is searched without a question pattern.
+        # It is about this university, so its name goes into the search words.
+        self.assertIn("八王子は晴れ", run("学食はおいしいですか"))
+        self.assertEqual(queries, ["東京工科大学 学食はおいしい"])
+
+        # A failed search falls back to the plain path (with the outside-corpus note when it applies).
+        class FailingSearcher(FakeSearcher):
+            async def search(self, query):
+                raise TimeoutError("slow")
+
+        router._cached_web_searcher = FailingSearcher()
+        self.assertTrue(run("学食はおいしいですか").startswith(tokkio_rag.OUTSIDE_CORPUS_PROMPT_NOTE))
+        # The second failure pauses searching; the next turn does not wait for the web.
+        self.assertTrue(run("学食はおいしいですか").startswith(tokkio_rag.OUTSIDE_CORPUS_PROMPT_NOTE))
+        self.assertTrue(tokkio_rag.SEARCH_BREAKER.is_open(__import__("time").time()))
+
+        # No key file: web search stays off.
+        del router._cached_web_searcher
+        with tempfile.TemporaryDirectory() as tmp:
+            router.local_db_path = str(Path(tmp) / "local_rag.sqlite")
+            self.assertIsNone(router._web_searcher())
+
+    def test_prepare_writes_the_web_search_key_file_only_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            generated_dir = Path(tmp)
+            key_path = generated_dir / "exa_api_key"
+            values = {"TOKKIO_ACE_BRANCH": "5.0.0-ga", "TOKKIO_EXA_API_KEY": "test-key"}
+
+            result = prepare.sync_web_search_key(values, generated_dir)
+            self.assertEqual(result, {"enabled": True, "provider": "exa", "reason": ""})
+            self.assertEqual(key_path.read_text(encoding="utf-8"), "test-key\n")
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("test-key", repr(result))
+
+            result = prepare.sync_web_search_key({**values, "TOKKIO_WEB_SEARCH": "off"}, generated_dir)
+            self.assertFalse(result["enabled"])
+            self.assertFalse(key_path.exists())
+
+            prepare.sync_web_search_key(values, generated_dir)
+            prepare.sync_web_search_key({"TOKKIO_ACE_BRANCH": "5.0.0-ga"}, generated_dir)
+            self.assertFalse(key_path.exists())
+
     def test_custom_config_yaml_uses_early_cached_filler_delay(self) -> None:
         yaml_text = customize.build_config_yaml()
 
-        self.assertIn('        - "確認しています"', yaml_text)
-        self.assertIn("    time_delay: 2.5", yaml_text)
+        self.assertIn('    filler:\n        - "そうですね。"\n    time_delay: 1.0\n', yaml_text)
+        self.assertIn("    filler: []", customize.build_config_yaml(tts_processor="QwenTTSService"))
 
     def test_custom_config_yaml_routes_kagawa_profile_detail_questions_by_default(self) -> None:
         yaml_text = customize.build_config_yaml(rag_enabled=True, rag_mode="auto")
@@ -496,8 +961,21 @@ class TokkioLlmConfigTests(unittest.TestCase):
 
         self.assertEqual(
             tokkio_llm.get_fast_profile_reply([{"role": "user", "content": "おはようございます。"}]),
-            "おはようございます。",
+            "おはようございます。お会いできてうれしいです。",
         )
+        self.assertEqual(
+            tokkio_llm.get_fast_profile_reply([{"role": "user", "content": "先生のお名前を教えてください"}]),
+            "私は香川豊です。",
+        )
+        # Someone else's name or age is not the persona's (2026-10-17 audit).
+        for text in (
+            "あなたのお父さんは何歳ですか。",
+            "あなたの会社の名前は",
+            "香川先生の名前の由来は",
+            "息子は何歳ですか",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(tokkio_llm.get_fast_profile_reply([{"role": "user", "content": text}]))
         self.assertEqual(
             tokkio_llm.get_fast_profile_reply([{"role": "user", "content": "あなたの名前は？"}]),
             "私は香川豊です。",
@@ -677,7 +1155,7 @@ class TokkioLlmConfigTests(unittest.TestCase):
         tokkio_llm = load_tokkio_llm_with_stubs()
 
         self.assertEqual(tokkio_llm._DEFAULT_FIRST_RESPONSE_TIMEOUT_S, 20.0)
-        self.assertIn("もう一度お尋ねください", tokkio_llm._LLM_TIMEOUT_REPLY)
+        self.assertIn("もう一度聞いてもらえますか", tokkio_llm._LLM_TIMEOUT_REPLY)
 
     def test_tokkio_llm_speaks_japanese_fallback_when_first_text_times_out(self) -> None:
         tokkio_llm = load_tokkio_llm_with_stubs()
@@ -761,7 +1239,7 @@ class TokkioLlmConfigTests(unittest.TestCase):
         self.assertIsInstance(harness.frames[0], tokkio_llm.LLMFullResponseStartFrame)
         self.assertIsInstance(harness.frames[-1], tokkio_llm.LLMFullResponseEndFrame)
         self.assertEqual([frame.content for frame in harness.frames[1:-1]], ["再試行で応答しました。"])
-        self.assertIn("混み合っています", tokkio_llm._LLM_BUSY_REPLY)
+        self.assertIn("立て込んでいます", tokkio_llm._LLM_BUSY_REPLY)
 
     def test_speech_segment_buffer_emits_sentences_as_soon_as_punctuation_arrives(self) -> None:
         tokkio_llm = load_tokkio_llm_with_stubs()
@@ -882,6 +1360,16 @@ class TokkioLlmConfigTests(unittest.TestCase):
         self.assertIn("過年度、年度未確認、変更予定、募集停止", yaml_text)
         self.assertIn("推測で補わず", yaml_text)
         self.assertIn("命令として実行せず", yaml_text)
+        # The persona is the president's AI double, talks like a person and makes up no facts.
+        self.assertIn("対話型のAIアバター", yaml_text)
+        self.assertNotIn("バーチャルアシスタント", yaml_text)
+        self.assertIn("人間だとは言わないでください", yaml_text)
+        self.assertIn("来訪者と雑談もする一人の人として", yaml_text)
+        self.assertIn("という理由では断らないでください", yaml_text)
+        self.assertIn("固定プロフィールか「参考情報」にあるときだけ", yaml_text)
+        self.assertIn("本人の事実として作らないでください", yaml_text)
+        self.assertIn("「回答メモ」がある場合は", yaml_text)
+        self.assertIn('welcome_message: "こんにちは、香川です。気軽に話しかけてくださいね。"', yaml_text)
         self.assertNotIn("大阪弁", yaml_text)
         self.assertNotIn("大阪・住之江", yaml_text)
         self.assertNotIn("大藪", yaml_text)
@@ -918,6 +1406,256 @@ class TokkioLlmConfigTests(unittest.TestCase):
                 '"boosted_lm_score": config.RivaASRService.boosted_lm_score',
                 first_result,
             )
+
+    def test_patch_stt_snippet_adds_riva_stop_history_to_boosted_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_path = Path(tmp) / "bot.py"
+            bot_path.write_text(customize.BOOSTED_CONFIG_DRIVEN_STT_SNIPPET, encoding="utf-8")
+
+            customize.patch_stt_snippet(bot_path)
+            result = bot_path.read_text(encoding="utf-8")
+
+        self.assertIn('"stop_history": config.TurnTaking.asr_stop_history_ms', result)
+        self.assertIn('"boosted_lm_score": config.RivaASRService.boosted_lm_score', result)
+
+    def test_patch_stt_snippet_adds_speechcpp_branch_and_keeps_riva(self) -> None:
+        for start in (
+            customize.SPEECHCPP_STT_SELECTION_SNIPPET_20261017,
+            customize.NEW_CONFIG_DRIVEN_STT_SNIPPET,
+            customize.BOOSTED_CONFIG_DRIVEN_STT_SNIPPET,
+            customize.PREVIOUS_CONFIG_DRIVEN_STT_SNIPPET,
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                bot_path = Path(tmp) / "bot.py"
+                bot_path.write_text(start, encoding="utf-8")
+
+                customize.patch_stt_snippet(bot_path)
+                first_result = bot_path.read_text(encoding="utf-8")
+                customize.patch_stt_snippet(bot_path)
+
+                self.assertEqual(first_result, bot_path.read_text(encoding="utf-8"))
+            self.assertEqual(first_result, customize.CONFIG_DRIVEN_STT_SELECTION_SNIPPET)
+        self.assertIn('        if config.Pipeline.stt_processor == "SpeechCppSTTService":\n', first_result)
+        self.assertIn("            from .tokkio_speechcpp_stt import SpeechCppSTTService\n", first_result)
+        for field in ("base_url", "model", "language", "prompt", "chunking_strategy", "timeout_s"):
+            self.assertIn(f"                {field}=config.SpeechCppSTTService.{field},\n", first_result)
+        self.assertIn("        else:\n            stt = RivaASRService(**stt_kwargs)\n", first_result)
+        self.assertIn('"stop_history": config.TurnTaking.asr_stop_history_ms', first_result)
+
+    def test_config_yaml_configures_speechcpp_stt(self) -> None:
+        config = load_generated_config_model().Config(**yaml.safe_load(customize.build_config_yaml()))
+
+        # Chosen on 2026-10-17 over Riva (docs/audits/speech-cpp-asr-2026-10-17.md); Haas since
+        # 2026-11-02 (docs/audits/speech-cpp-asr-haas-2026-11-02.md).
+        self.assertEqual(config.Pipeline.stt_processor, "SpeechCppSTTService")
+        stt = config.SpeechCppSTTService
+        self.assertEqual(stt.base_url, "http://10.209.1.12:8024/v1")
+        # speech serve answers a model it does not hold with a 404; its id comes from the file.
+        self.assertEqual(stt.model, "Haas-ja-v1.0")
+        self.assertEqual(stt.language, "ja")
+        # Haas refuses a prompt (400); 青嵐 is the server's custom vocabulary.
+        self.assertEqual(stt.prompt, "")
+        # Without it Haas writes 「うん。」 for noise.
+        self.assertEqual(stt.chunking_strategy, "auto")
+        self.assertEqual(stt.timeout_s, 10.0)
+
+    def test_english_mode_speechcpp_stt_listens_in_english_on_the_qwen_unit(self) -> None:
+        values = yaml.safe_load(customize.build_config_yaml(tts_processor="QwenTTSService"))
+
+        # Haas takes Japanese only, so the English mode calls Qwen3-ASR (ace-speechcpp-asr-en.service).
+        stt = values["SpeechCppSTTService"]
+        self.assertEqual(stt["base_url"], "http://10.209.1.12:8025/v1")
+        self.assertEqual(stt["model"], "Qwen3-ASR-1.7B")
+        self.assertEqual(stt["language"], "en")
+        self.assertEqual(stt["prompt"], "")
+        self.assertEqual(stt["chunking_strategy"], "")
+
+    def test_generated_config_model_defaults_to_riva_without_stt_settings(self) -> None:
+        values = yaml.safe_load(customize.build_config_yaml())
+        del values["Pipeline"]["stt_processor"]
+        del values["SpeechCppSTTService"]
+
+        config = load_generated_config_model().Config(**values)
+
+        self.assertEqual(config.Pipeline.stt_processor, "RivaASRService")
+        self.assertEqual(config.SpeechCppSTTService.prompt, "")
+        self.assertEqual(config.SpeechCppSTTService.chunking_strategy, "")
+
+    def test_patch_turn_taking_snippets_wire_vad_and_aggregation_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_path = Path(tmp) / "bot.py"
+            bot_path.write_text(UPSTREAM_BOT_FIXTURE, encoding="utf-8")
+
+            customize.patch_turn_taking_snippets(bot_path)
+            first_result = bot_path.read_text(encoding="utf-8")
+            customize.patch_turn_taking_snippets(bot_path)
+
+            self.assertEqual(first_result, bot_path.read_text(encoding="utf-8"))
+        self.assertTrue(
+            first_result.startswith(
+                "# from pipecat.audio.vad.silero import SileroVADAnalyzer\n"
+                "from pipecat.audio.vad.silero import SileroVADAnalyzer\n"
+                "from pipecat.audio.vad.vad_analyzer import VADParams\n"
+                "from pipecat.processors.aggregators.llm_response import LLMUserAggregatorParams\n"
+            )
+        )
+        self.assertIn("params=VADParams(stop_secs=config.TurnTaking.vad_stop_secs_in_use)", first_result)
+        self.assertIn(
+            "user_params=LLMUserAggregatorParams(aggregation_timeout=config.TurnTaking.aggregation_timeout_s)",
+            first_result,
+        )
+        self.assertNotIn(customize.OLD_CONTEXT_AGGREGATOR_SNIPPET, first_result)
+        # The gate is built after the aggregator it resets, only when a switch is on,
+        # and joins the pipeline right after the STT.
+        self.assertEqual(first_result.count("from .tokkio_turn import build_turn_gate"), 1)
+        gate_condition = 'if config.TurnTaking.turn_end_mode != "vad" or config.TurnTaking.barge_in_mode != "immediate":'
+        self.assertLess(first_result.index("context_aggregator = "), first_result.index(gate_condition))
+        self.assertLess(first_result.index(gate_condition), first_result.index("from .tokkio_turn import"))
+        self.assertIn(
+            "                stt, # Speech-To-Text\n                *([turn_gate] if turn_gate is not None else []),\n",
+            first_result,
+        )
+
+    def test_patch_turn_taking_snippets_upgrade_a_bot_patched_before_the_turn_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_path = Path(tmp) / "bot.py"
+            bot_path.write_text(
+                customize.NEW_VAD_IMPORT_SNIPPET
+                + customize.PREVIOUS_VAD_SNIPPET
+                + customize.NEW_CONTEXT_AGGREGATOR_SNIPPET
+                + customize.OLD_PIPELINE_STT_SNIPPET,
+                encoding="utf-8",
+            )
+
+            customize.patch_turn_taking_snippets(bot_path)
+            first_result = bot_path.read_text(encoding="utf-8")
+            customize.patch_turn_taking_snippets(bot_path)
+
+            self.assertEqual(first_result, bot_path.read_text(encoding="utf-8"))
+        self.assertNotIn(customize.PREVIOUS_VAD_SNIPPET, first_result)
+        self.assertIn(customize.NEW_VAD_SNIPPET, first_result)
+        self.assertIn(customize.NEW_TURN_GATE_SNIPPET, first_result)
+        self.assertIn(customize.NEW_PIPELINE_STT_SNIPPET, first_result)
+
+    def test_patch_irodori_first_clause_snippet_leaves_the_english_tts_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot_path = Path(tmp) / "bot.py"
+            bot_path.write_text(customize.NEW_BOT_SNIPPET, encoding="utf-8")
+            customize.patch_qwen_tts_snippet(bot_path)
+
+            customize.patch_irodori_first_clause_snippet(bot_path)
+            customize.patch_irodori_first_clause_snippet(bot_path)
+            result = bot_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.count("start_on_first_clause="), 1)
+        qwen_branch = result.split('elif config.Pipeline.tts_processor == "QwenTTSService":', 1)[1]
+        self.assertNotIn("start_on_first_clause", qwen_branch.split("elif config.Pipeline.tts_processor", 1)[0])
+        self.assertIn("start_on_first_clause=config.IrodoriTTSService.start_on_first_clause", result)
+
+    def test_custom_config_yaml_sets_turn_taking_and_starts_tts_on_first_clause(self) -> None:
+        config = load_generated_config_model().Config(**yaml.safe_load(customize.build_config_yaml()))
+
+        # Riva at 250 ms split utterances and dropped characters at the cuts
+        # (docs/audits/speech-cpp-asr-2026-10-17.md); 500 ms needs the VAD at 0.8 s.
+        # speech.cpp gets one request per VAD segment, so 0.6 s is on trial (2026-10-17).
+        self.assertEqual(config.TurnTaking.vad_stop_secs, 0.6)
+        self.assertEqual(config.TurnTaking.asr_stop_history_ms, 500)
+        # speech.cpp sends one transcript per utterance, after the VAD stop, so the
+        # aggregation wait adds to every turn and there is nothing more to wait for.
+        self.assertEqual(config.TurnTaking.aggregation_timeout_s, 0.05)
+        # Riva's final must normally arrive before the VAD ends the turn, or
+        # pipecat waits aggregation_timeout_s more after it.
+        self.assertLess(config.TurnTaking.asr_stop_history_ms / 1000, config.TurnTaking.vad_stop_secs)
+        self.assertTrue(config.IrodoriTTSService.start_on_first_clause)
+
+    def test_turn_switches_are_off_and_the_spoken_style_is_on_by_default(self) -> None:
+        config = load_generated_config_model().Config(**yaml.safe_load(customize.build_config_yaml()))
+
+        # Off: bot.py builds no turn gate and the VAD keeps its 0.6 s.
+        self.assertEqual(config.TurnTaking.turn_end_mode, "vad")
+        self.assertEqual(config.TurnTaking.barge_in_mode, "immediate")
+        self.assertEqual(config.TurnTaking.vad_stop_secs_in_use, 0.6)
+        # The spoken-style block is part of the default prompt; off removes only that block.
+        self.assertTrue(config.OpenAILLMContext.prompt.endswith(customize.SPOKEN_STYLE_PROMPT))
+        plain = yaml.safe_load(customize.build_config_yaml(spoken_style=False))["OpenAILLMContext"]["prompt"]
+        self.assertNotIn("話し方:", plain)
+        self.assertEqual(config.OpenAILLMContext.prompt, f"{plain} {customize.SPOKEN_STYLE_PROMPT}")
+
+    def test_conversation_switches_set_the_turn_taking_keys_and_the_prompt(self) -> None:
+        text = customize.build_config_yaml(turn_end_mode="text", barge_in_mode="gated", spoken_style=True)
+        config = load_generated_config_model().Config(**yaml.safe_load(text))
+
+        self.assertEqual(config.TurnTaking.turn_end_mode, "text")
+        self.assertEqual(config.TurnTaking.barge_in_mode, "gated")
+        # The text rule needs the VAD to report short pauses; 0.6 s stays for rollback.
+        self.assertEqual(config.TurnTaking.vad_stop_secs, 0.6)
+        self.assertEqual(config.TurnTaking.vad_stop_secs_in_use, 0.2)
+        self.assertEqual(
+            (config.TurnTaking.turn_end_weak_wait_s, config.TurnTaking.turn_end_max_wait_s), (0.6, 0.8)
+        )
+        self.assertTrue(config.TurnTaking.turn_end_retranscribe)
+        self.assertIn("そうですね", config.TurnTaking.turn_end_hold_phrases)
+        self.assertEqual(config.TurnTaking.barge_in_backchannels, list(customize.TURN_BACKCHANNELS))
+        self.assertTrue(config.OpenAILLMContext.prompt.endswith(customize.SPOKEN_STYLE_PROMPT))
+        # Each switch works alone.
+        only_style = yaml.safe_load(customize.build_config_yaml(spoken_style=True))
+        self.assertEqual(only_style["TurnTaking"], yaml.safe_load(customize.build_config_yaml())["TurnTaking"])
+        only_turn_end = customize.build_config_yaml(turn_end_mode="text")
+        self.assertEqual(
+            only_turn_end.replace('turn_end_mode: "text"', 'turn_end_mode: "vad"'), customize.build_config_yaml()
+        )
+
+    def test_generated_config_model_defaults_match_the_yaml(self) -> None:
+        values = yaml.safe_load(customize.build_config_yaml())
+        turn_taking = dict(values["TurnTaking"])
+        for key in ("vad_stop_secs", "asr_stop_history_ms", "aggregation_timeout_s"):
+            del turn_taking[key]
+        values["TurnTaking"] = {key: values["TurnTaking"][key] for key in ("vad_stop_secs",)}
+
+        config = load_generated_config_model().Config(**values)
+
+        self.assertEqual({key: getattr(config.TurnTaking, key) for key in turn_taking}, turn_taking)
+
+    def test_english_mode_keeps_the_japanese_conversation_switches_off(self) -> None:
+        text = customize.build_config_yaml(
+            tts_processor="QwenTTSService", turn_end_mode="text", barge_in_mode="gated", spoken_style=True
+        )
+        config = load_generated_config_model().Config(**yaml.safe_load(text))
+
+        self.assertEqual((config.TurnTaking.turn_end_mode, config.TurnTaking.barge_in_mode), ("vad", "immediate"))
+        self.assertNotIn("話し方:", config.OpenAILLMContext.prompt)
+
+    def test_unknown_conversation_switch_values_are_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "TOKKIO_TURN_END"):
+            customize.build_config_yaml(turn_end_mode="smart")
+        with self.assertRaisesRegex(ValueError, "TOKKIO_BARGE_IN"):
+            customize.build_config_yaml(barge_in_mode="never")
+
+    def test_prepare_passes_the_conversation_switches_to_the_customizer(self) -> None:
+        self.assertEqual(
+            prepare.conversation_switch_args({}),
+            ["--turn-end", "vad", "--barge-in", "immediate", "--spoken-style", "true"],
+        )
+        self.assertEqual(prepare.conversation_switch_args({"TOKKIO_SPOKEN_STYLE": "off"})[-1], "false")
+        self.assertEqual(
+            prepare.conversation_switch_args(
+                {"TOKKIO_TURN_END": " text ", "TOKKIO_BARGE_IN": "gated", "TOKKIO_SPOKEN_STYLE": "on"}
+            ),
+            ["--turn-end", "text", "--barge-in", "gated", "--spoken-style", "true"],
+        )
+
+    def test_generated_config_model_keeps_upstream_timing_without_turn_taking(self) -> None:
+        values = yaml.safe_load(customize.build_config_yaml(tts_processor="QwenTTSService"))
+        del values["TurnTaking"]
+        del values["IrodoriTTSService"]["start_on_first_clause"]
+
+        config = load_generated_config_model().Config(**values)
+
+        self.assertEqual(
+            (config.TurnTaking.vad_stop_secs, config.TurnTaking.asr_stop_history_ms, config.TurnTaking.aggregation_timeout_s),
+            (0.8, 500, 0.5),
+        )
+        self.assertFalse(config.IrodoriTTSService.start_on_first_clause)
 
     def test_patch_riva_values_uses_japanese_asr_rmir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1105,7 +1843,7 @@ class TokkioLlmConfigTests(unittest.TestCase):
             (llm_rag_dir / "src" / "config.py").write_text("# old config\n", encoding="utf-8")
             (llm_rag_dir / "configs" / "config.yaml").write_text("OpenAILLMContext:\n  name: Aki\n", encoding="utf-8")
             (llm_rag_dir / "src" / "bot.py").write_text(
-                customize.OLD_LLM_SNIPPET + "\n" + customize.OLD_BOT_SNIPPET,
+                UPSTREAM_BOT_FIXTURE,
                 encoding="utf-8",
             )
             values_path = (
@@ -1129,6 +1867,18 @@ class TokkioLlmConfigTests(unittest.TestCase):
             )
 
             profile_config = profile_config_path.read_text(encoding="utf-8")
+            bot_text = (llm_rag_dir / "src" / "bot.py").read_text(encoding="utf-8")
+            for snippet in (
+                customize.NEW_VAD_IMPORT_SNIPPET,
+                customize.NEW_VAD_SNIPPET,
+                customize.NEW_CONTEXT_AGGREGATOR_SNIPPET,
+                customize.NEW_TURN_GATE_SNIPPET,
+                customize.NEW_PIPELINE_STT_SNIPPET,
+                customize.CONFIG_DRIVEN_STT_SELECTION_SNIPPET,
+                customize.NEW_IRODORI_FIRST_CLAUSE_SNIPPET,
+            ):
+                self.assertIn(snippet, bot_text)
+            self.assertIn("    start_on_first_clause: true", profile_config)
             self.assertIn('name: "香川豊"', profile_config)
             self.assertIn("東京工科大学 学長", profile_config)
             self.assertIn(f'base_url: "{EXPECTED_LLM_BASE_URL}"', profile_config)
@@ -1136,6 +1886,11 @@ class TokkioLlmConfigTests(unittest.TestCase):
             self.assertIn('tts_processor: "IrodoriTTSService"', profile_config)
             self.assertIn('base_url: "http://10.209.1.12:8021"', profile_config)
             self.assertTrue((llm_rag_dir / "src" / "tokkio_irodori_tts.py").is_file())
+            self.assertTrue((llm_rag_dir / "src" / "tokkio_speechcpp_stt.py").is_file())
+            self.assertEqual(
+                (llm_rag_dir / "src" / "tokkio_turn.py").read_text(encoding="utf-8"),
+                (ROOT / "infra" / "tokkio" / "tokkio_turn.py").read_text(encoding="utf-8"),
+            )
             self.assertTrue((llm_rag_dir / "src" / "tokkio_llm.py").is_file())
             self.assertTrue((llm_rag_dir / "src" / "local_rag.py").is_file())
             self.assertTrue((llm_rag_dir / "src" / "tokkio_rag.py").is_file())
@@ -1173,7 +1928,7 @@ class TokkioLlmConfigTests(unittest.TestCase):
             (llm_rag_dir / "src" / "config.py").write_text("# old config\n", encoding="utf-8")
             (llm_rag_dir / "configs" / "config.yaml").write_text("OpenAILLMContext:\n  name: Aki\n", encoding="utf-8")
             (llm_rag_dir / "src" / "bot.py").write_text(
-                customize.OLD_LLM_SNIPPET + "\n" + customize.OLD_BOT_SNIPPET,
+                UPSTREAM_BOT_FIXTURE,
                 encoding="utf-8",
             )
             values_path = (
@@ -1218,7 +1973,7 @@ class TokkioLlmConfigTests(unittest.TestCase):
             (llm_rag_dir / "src" / "config.py").write_text("# old config\n", encoding="utf-8")
             (llm_rag_dir / "configs" / "config.yaml").write_text("OpenAILLMContext:\n  name: Aki\n", encoding="utf-8")
             (llm_rag_dir / "src" / "bot.py").write_text(
-                customize.OLD_LLM_SNIPPET + "\n" + customize.OLD_BOT_SNIPPET,
+                UPSTREAM_BOT_FIXTURE,
                 encoding="utf-8",
             )
             values_path = (

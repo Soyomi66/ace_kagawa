@@ -880,7 +880,7 @@ def _rows_to_hits(rows: Iterable[sqlite3.Row]) -> list[LocalRagHit]:
 def _query_intents(query: str) -> set[str]:
     compact = re.sub(r"\s+", "", normalize_query(query)).lower()
     intents: set[str] = set()
-    if any(term in compact for term in ("アクセス", "行き方", "交通", "駅", "バス")):
+    if any(term in compact for term in ("アクセス", "行き方", "交通", "駅", "バス", "住所", "所在地")):
         intents.add("access")
     if any(
         term in compact
@@ -902,6 +902,7 @@ def _query_intents(query: str) -> set[str]:
             "入学試験日",
             "試験日",
             "入学手続期限",
+            "納入金",
         )
     ):
         intents.add("admissions")
@@ -934,7 +935,7 @@ def _query_intents(query: str) -> set[str]:
         intents.add("admission_subjects")
     if "admissions" in intents and any(term in compact for term in ("選抜方法", "配点", "面接試験", "プレゼンテーション")):
         intents.add("admission_selection_method")
-    if any(term in compact for term in ("学費", "入学金", "授業料")):
+    if any(term in compact for term in ("学費", "入学金", "授業料", "納入金")):
         intents.add("admission_tuition")
     if any(term in compact for term in ("奨学金", "奨学生")):
         intents.add("admission_scholarship")
@@ -1029,6 +1030,8 @@ def _query_intents(query: str) -> set[str]:
             {"profile_fields", "career", "education", "birth_profile", "current_role", "research", "publication", "award"}
         )
         and any(term in compact for term in ("について教えて", "について説明", "どんな人", "プロフィール"))
+        # 香川先生の家族について教えて asks about the family, not about the post.
+        and not query_content_terms(query)
     ):
         intents.add("current_role")
     return intents
@@ -1840,11 +1843,49 @@ _CONTENT_BOOST_WEIGHT = 150.0
 GENERIC_ROUTE_OUTSIDE_CORPUS_REASON = "generic_route_outside_corpus"
 # Sent instead of retrieved context when such a question goes to the plain LLM. Without it the
 # persona prompt led the LLM to invent links to Kagawa's research (verified against swallow-8b).
+# The heading is not 参考情報: the block carries no evidence, only how to answer.
 OUTSIDE_CORPUS_PROMPT_NOTE = (
-    "参考情報: この質問の話題は、私（香川豊）や東京工科大学の資料には含まれていません。"
-    "一般的な知識として簡潔に答え、私の研究、経歴、所属組織と関係づけないでください。"
-    "東京工科大学についての数や固有の事実を聞かれている場合は推測せず、確認できないと答えてください。"
+    "回答メモ: この質問の話題について、東京工科大学や私（香川豊）の資料は手元にありません。"
+    "一般的な知識や自分の考えで答えられることは、会話の調子で具体的に答えてください。"
+    "私の研究、経歴、所属組織と無理に関係づけないでください。"
+    "東京工科大学に固有の数や事実（施設、周辺の店、制度、人数、実績、評判など）と、私自身の経験や思い出は推測せず、"
+    "「〜と聞いています」のような伝聞の形でも作らず、正確なところはいま手元にないと、人が話す言い方で短く伝えてください。"
 )
+_UNGROUNDED_NOTE_TAIL = "「確認できません」「参考情報にありません」のような言い方はせず、人が話す言い方にしてください。"
+UNGROUNDED_PERSON_PROMPT_NOTE = (
+    "回答メモ: 質問に出てくる「{person}」という方について、確かな資料は手元にありません。"
+    "その方の所属、研究、経歴、居場所は推測せず、その方のことは詳しく分からないと短く伝え、"
+    "大学の窓口や公式サイトで分かるとひとこと添えてください。" + _UNGROUNDED_NOTE_TAIL
+)
+UNGROUNDED_SELF_PROMPT_NOTE = (
+    "回答メモ: これは私（香川豊）自身についての質問ですが、聞かれた点についての確かな資料は手元にありません。"
+    "固定プロフィールから分かることと、研究や仕事についての一般的な説明や考えは、自分の言葉で答えてください。"
+    "AIかどうか、本物かどうかを聞かれている場合は、本人の分身のAIアバターだと隠さずに答えてください。"
+    "私生活、思い出、動機、経歴や業績の細部は本人の事実として作らず、"
+    "AIの私はそこまで本人から聞いていないと軽くかわしてください。" + _UNGROUNDED_NOTE_TAIL
+)
+UNGROUNDED_UNIVERSITY_PROMPT_NOTE = (
+    "回答メモ: これは東京工科大学についての質問ですが、聞かれた点に答えられる確かな資料は手元にありません。"
+    "数値、日程、制度、施設、人名、実績は推測で答えず、正確なところはいま手元にないと短く伝え、"
+    "大学の窓口や公式サイトで分かるとひとこと添えてください。"
+    "一般論として言えることがあれば、一般論だと分かる言い方で添えて構いません。" + _UNGROUNDED_NOTE_TAIL
+)
+
+
+def ungrounded_prompt_note(assessment: LocalRagAssessment) -> str:
+    """How the LLM should answer a routed question whose evidence was rejected.
+
+    Such turns used to get one fixed sentence. The LLM now answers them in its own words,
+    told what it must not make up: the unknown person, Kagawa's private facts, or the
+    university's numbers and dates.
+    """
+
+    reason = assessment.reason
+    if reason.startswith("unknown_person:"):
+        return UNGROUNDED_PERSON_PROMPT_NOTE.format(person=reason.split(":", 1)[1])
+    if assessment.domain.startswith("kagawa_"):
+        return UNGROUNDED_SELF_PROMPT_NOTE
+    return UNGROUNDED_UNIVERSITY_PROMPT_NOTE
 
 
 def _free_query_terms(route_keywords: Iterable[str] = ()) -> frozenset[str]:
@@ -2079,12 +2120,99 @@ _FOLLOWUP_TERMS = (
 )
 
 
+# A short question that names no topic of its own (いつですか, 場所はどこですか, 参加方法を教えてください,
+# それって難しいんですか) asks about the topic of the turn before it (2026-10-17 audit).
+_FOLLOWUP_ASK_RE = re.compile(
+    r"いつ|どこ|どちら|どれ|どの|どんな|どう|どなた|誰|だれ|何|なに|なぜ|いくら|いくつ"
+    r"|教えて|知りたい|聞きたい|お願い"
+)
+# それって難しいんですか points back and asks; それはすごいですね points back and only reacts.
+_FOLLOWUP_POINTS_BACK_RE = re.compile(r"^(?:それ|その|そこ|これ|この|あれ)")
+_FOLLOWUP_QUESTION_END_RE = re.compile(r"(?:か|かな|かね|の|っけ)$")
+# The answer to a question the avatar asked back (どちらのキャンパスですか, どの研究科ですか).
+_CLARIFICATION_ANSWER_RE = re.compile(
+    r"(?:(?:八王子|蒲田)(?:キャンパス)?|[一-龥ァ-ヶー・]{2,14}研究科(?:の?[一-龥]{2,6}課程)?)"
+    r"(?:のほう|の方)?(?:です|で|でお願いします|をお願いします)?"
+)
+_FOLLOWUP_MARKER = "\nフォローアップ: "
+# Reactions are not questions: そうなんですか must not repeat the previous answer.
+_FOLLOWUP_REACTION_RE = re.compile(
+    r"^(?:へ[えぇー]+|ほ[うおー]+|ああ|おお|うん|はい|ええ|なるほど|たしかに|確かに|すごい|さすが)"
+    r"|^そう(?:です|なん|でした|だった|か)|ありがとう|どうも"
+)
+_FOLLOWUP_MAX_CHARS = 30
+# The topic is searched for until this many turns that are not follow-ups have been passed.
+_FOLLOWUP_LOOKBACK_TURNS = 2  # one reaction (すごいですね) may sit in between
+
+
 def _looks_like_followup(query: str) -> bool:
     normalized = normalize_query(query)
     compact = re.sub(r"\s+", "", normalized)
     if not compact or len(compact) > 40:
         return False
-    return bool(_FOLLOWUP_RE.fullmatch(compact)) or any(term in compact for term in _FOLLOWUP_TERMS)
+    if bool(_FOLLOWUP_RE.fullmatch(compact)) or any(term in compact for term in _FOLLOWUP_TERMS):
+        return True
+    core = compact.strip("。.!！?？、,")
+    if len(core) > _FOLLOWUP_MAX_CHARS or _FOLLOWUP_REACTION_RE.search(core):
+        return False
+    # A question to the persona (先生は何が好きですか) starts its own topic.
+    if any(term in core for term in _PERSONA_TERMS) or query_content_terms(core):
+        return False
+    if _FOLLOWUP_ASK_RE.search(core):
+        return True
+    return bool(_FOLLOWUP_POINTS_BACK_RE.match(core) and _FOLLOWUP_QUESTION_END_RE.search(core))
+
+
+_KANJI_NUMERAL_CHARS = frozenset("〇零一二三四五六七八九十百千万億")
+_KANA_OR_ASCII_RE = re.compile(r"[\u3040-\u30ffA-Za-z0-9]")
+# Dates, times, ages and amounts in kanji (三月二十日, 百二十万円) are real speech.
+_NUMERAL_COUNTER_RE = re.compile(r"[年月日時分秒円歳人回個本枚度号階位点]")
+
+
+def looks_like_garbled_transcript(text: str) -> bool:
+    """True for a short transcript with no kana made mostly of kanji numerals.
+
+    ASR turns unclear speech into strings such as 千五百一二百話; the plain LLM then answers
+    them as a real question, so Tokkio asks the visitor to repeat instead.
+    """
+
+    compact = re.sub(r"[\s、。,.!?！？]", "", unicodedata.normalize("NFKC", str(text)))
+    if not 5 <= len(compact) <= 12 or _KANA_OR_ASCII_RE.search(compact) or _NUMERAL_COUNTER_RE.search(compact):
+        return False
+    numerals = sum(char in _KANJI_NUMERAL_CHARS for char in compact)
+    return numerals / len(compact) >= 0.6
+
+
+# University-life topics the corpus does not cover (2026-11-13: 学食, 寮 and 就職 had 0-2 hits).
+_UNIVERSITY_LIFE_TERMS = (
+    "学食", "食堂", "寮", "就職", "サークル", "部活", "アルバイト", "バイト", "留学", "偏差値",
+    "倍率", "学園祭", "文化祭", "下宿", "一人暮らし", "通学",
+)
+_PERSONA_TERMS = ("あなた", "香川", "先生", "学長")
+
+
+def needs_outside_corpus_note(query: str) -> bool:
+    """True for a direct-route question about university life that the corpus does not cover,
+    so the LLM says it cannot confirm instead of inventing facts. Questions about Kagawa himself
+    are left alone: the persona prompt answers them."""
+
+    compact = re.sub(r"\s+", "", normalize_query(query))
+    if any(term in compact for term in _PERSONA_TERMS):
+        return False
+    return any(term in compact for term in _UNIVERSITY_LIFE_TERMS)
+
+
+# Words that make a direct-route question one about this university or its campus
+# (大学の近くにコンビニはありますか): Gemma 4 answered 「すぐ近くにいくつかありますよ」 without the note.
+_CAMPUS_TERMS = ("大学", "キャンパス", "学内", "構内", "校内", "本学", "学校")
+
+
+def asks_about_campus(query: str) -> bool:
+    """True for a direct-route question that mentions the university or its campus, so the
+    LLM gets the outside-corpus note. It does not widen what is sent to web search."""
+
+    compact = re.sub(r"\s+", "", normalize_query(query))
+    return any(term in compact for term in _CAMPUS_TERMS)
 
 
 _YEAR_PREFIX_FRAGMENT_RE = re.compile(r"^20\d{2}(?:年度|年)?(?:の)?$")
@@ -2100,6 +2228,20 @@ def resolve_conversation_query(user_messages: Iterable[str], route_keywords: Ite
         if _YEAR_PREFIX_FRAGMENT_RE.fullmatch(re.sub(r"\s+", "", previous)):
             current = f"{previous}{current}"
     current_route = classify_query(current, route_keywords)
+    if len(messages) >= 2:
+        previous = messages[-2]
+        core = re.sub(r"\s+", "", current).strip("。.!！?？、,")
+        if _CLARIFICATION_ANSWER_RE.fullmatch(core) and classify_query(previous, route_keywords).route_candidate:
+            # 八王子です answers どちらのキャンパスですか: the question before it is still the question.
+            return f"{previous}{_FOLLOWUP_MARKER}{current}"
+        if (
+            current_route.domain == "access"
+            and not _query_locations(current)
+            and _query_locations(previous)
+            and classify_query(previous, route_keywords).domain == "access"
+        ):
+            # バスで何分ですか after 八王子キャンパスへの行き方 is about the same campus.
+            return f"{previous}{_FOLLOWUP_MARKER}{current}"
     if current_route.route_candidate or current_route.reason in {
         "greeting",
         "weather",
@@ -2109,9 +2251,17 @@ def resolve_conversation_query(user_messages: Iterable[str], route_keywords: Ite
         return current
     if not _looks_like_followup(current):
         return current
+    # Follow-ups in a row share one topic. Other turns in between are counted: after a
+    # chat about something else, それはいつですか no longer means the old topic.
+    other_turns = 0
     for previous in reversed(messages[:-1]):
         if classify_query(previous, route_keywords).route_candidate:
-            return f"{previous}\nフォローアップ: {current}"
+            return f"{previous}{_FOLLOWUP_MARKER}{current}"
+        if _looks_like_followup(previous):
+            continue
+        other_turns += 1
+        if other_turns >= _FOLLOWUP_LOOKBACK_TURNS:
+            break
     return current
 
 
@@ -2272,15 +2422,24 @@ def grounded_direct_reply(
     compact = re.sub(r"\s+", "", normalize_query(query))
     evidence = " ".join(hit.text for hit in hits)
     if route.domain == "access":
+        if "住所" in compact or "所在地" in compact:
+            # The fixed replies are the routes from the stations; the address is in the context.
+            return None
         if "八王子" in compact:
             return next((hit.text.strip() for hit in hits if "八王子" in hit.text), None)
         if "蒲田" in compact:
             return next((hit.text.strip() for hit in hits if "蒲田" in hit.text), None)
-        return "アクセスは八王子キャンパスと蒲田キャンパスで異なります。キャンパス名を指定してください。"
+        return "行き方は八王子キャンパスと蒲田キャンパスで違います。どちらのキャンパスですか。"
 
-    if route.domain == "kagawa_profile" and "current_role" in route.intents:
+    # Only when the question is about the persona: 東京工科大学を作った人は誰ですか also has
+    # the current_role intent (誰ですか) and must not be answered with Kagawa's post.
+    if (
+        route.domain == "kagawa_profile"
+        and "current_role" in route.intents
+        and any(term in compact for term in _PERSON_SCOPE_TERMS)
+    ):
         if "東京工科大学の学長" in evidence and "セラミックス複合材料センター長" in evidence:
-            return "香川豊は東京工科大学の学長・教授で、セラミックス複合材料センター長です。"
+            return "私は東京工科大学の学長で、片柳研究所の教授とセラミックス複合材料センター長も務めています。"
 
     if route.domain == "open_campus" and any(term in compact for term in ("次", "いつ", "日程", "開催")):
         reference_date = today or date.today()
@@ -2300,7 +2459,7 @@ def grounded_direct_reply(
             day = f"{last_date.month}月{last_date.day}日"
             if last_date.year != reference_date.year:
                 day = f"{last_date.year}年{day}"
-            return f"直近のオープンキャンパスは{day}の{last_location}で終了しており、次回の日程はまだ確認できません。"
+            return f"直近のオープンキャンパスは{day}の{last_location}で、もう終わっています。次回の日程はまだ分からないんです。"
         if upcoming:
             upcoming.sort()
             next_date, next_location = upcoming[0]
@@ -2323,13 +2482,13 @@ def grounded_direct_reply(
         return None
 
     if "admission_selection_method" in route.intents:
-        return "大学院入試の選抜方法は研究科・課程で異なります。研究科名と課程を指定してください。"
+        return "大学院入試の選抜方法は研究科と課程で違います。どの研究科のどの課程ですか。"
     if "出願資格" in compact:
-        return "大学院入試の出願資格は研究科・課程で異なります。研究科名と課程を指定してください。"
+        return "大学院入試の出願資格は研究科と課程で違います。どの研究科のどの課程ですか。"
     if "admission_tuition" in route.intents:
-        return "現在の参照情報では、大学院の学費の正確な金額を確認できません。"
+        return "大学院の学費の正確な金額は、いま手元にないんです。大学の公式サイトで確かめてもらえますか。"
     if "admission_scholarship" in route.intents:
-        return "現在の参照情報では、大学院向け奨学金の詳細を確認できません。"
+        return "大学院向けの奨学金の詳しいところは、いま手元にないんです。大学の公式サイトで確かめてもらえますか。"
 
     if "admission_calendar" in route.intents:
         if "合格発表" in compact and "2026年9月8日" in evidence and "2027年2月16日" in evidence:
@@ -2343,7 +2502,7 @@ def grounded_direct_reply(
                 return "医療技術学研究科の出願期間は、A日程が2026年7月28日から7月30日、B日程が2027年1月6日から1月8日です。"
             if any(term in compact for term in ("工学研究科", "バイオ・情報メディア研究科")) and "1月7日" in evidence:
                 return "出願期間は、A日程が2026年7月28日から7月30日、B日程が2027年1月5日から1月7日です。"
-            return "大学院入試の出願期間は研究科により異なります。研究科名を指定してお尋ねください。"
+            return "大学院入試の出願期間は研究科によって違います。どの研究科ですか。"
         if "2026年8月29日" in evidence and "2027年1月30日" in evidence:
             return (
                 "2027年度大学院入試の試験日は、A日程が2026年8月29日、"
@@ -2361,6 +2520,27 @@ def grounded_direct_reply(
     if len(fields) < 3:
         return None
     return f"大学院入試では、{'、'.join(fields)}などをご案内しています。"
+
+
+def grounded_direct_reply_for_turn(
+    query: str,
+    hits: list[LocalRagHit],
+    *,
+    today: date | None = None,
+) -> str | None:
+    """grounded_direct_reply(), unless the turn is a follow-up the fixed reply does not answer.
+
+    A follow-up is searched together with the question before it. When the fixed reply is the
+    one that question alone gets, the follow-up changed nothing: the reply would repeat the
+    earlier answer (次のオープンキャンパスはいつですか, then 場所はどこですか), so the LLM answers.
+    """
+
+    reply = grounded_direct_reply(query, hits, today=today)
+    if reply and _FOLLOWUP_MARKER in query:
+        previous = query.split(_FOLLOWUP_MARKER, 1)[0]
+        if grounded_direct_reply(previous, hits, today=today) == reply:
+            return None
+    return reply
 
 
 def citations_for_hits(hits: list[LocalRagHit]) -> list[dict]:
@@ -2469,6 +2649,23 @@ def _prompt_hits_for_query(hits: list[LocalRagHit], query: str) -> list[LocalRag
             for hit in selected
             if hit.temporal_status.strip().lower() != "versioned_page_verify_year"
         ]
+    # When some sources mention what the question asks about (寮) and others do not, the
+    # others only invite mix-ups: Gemma called the supercomputer's building a dormitory.
+    content_terms = query_content_terms(query)
+    if content_terms:
+        free = _default_free_query_terms()
+        on_topic = [
+            hit
+            for hit in selected
+            if any(
+                _content_term_covered(
+                    term, " ".join((hit.section_title, hit.source_title, hit.keywords, hit.text)).lower(), free
+                )
+                for term in content_terms
+            )
+        ]
+        if on_topic:
+            selected = on_topic
     return selected
 
 
@@ -2524,7 +2721,7 @@ def format_hits_for_prompt_with_sources(
         lines.append(
             f"注意: {_ENDED_EVENT_MARKER}の行事は{reference_date.isoformat()}時点で開催済みです。"
             "日付を今後の予定として述べず、過去に行われた内容として説明し、"
-            "次回の日程はまだ確認できないと伝えてください。"
+            "次回の日程はまだ分からないと伝えてください。"
         )
     used = sum(len(line) + 1 for line in lines)
     included_hits: list[LocalRagHit] = []

@@ -27,7 +27,7 @@
   - `NvidiaRAGService.vdb_top_k=12` / `reranker_top_k=5` / `enable_reranker=true` で検索精度を保ちながら LLM に渡す context 量を抑える
   - 表・図・画像系の質問では `multimodal_reranker_top_k=10` に自動で広げる
   - `NvidiaRAGService.max_tokens=64` と「通常40〜60文字・原則1文、詳細時も100文字以内・最大2文」の短文プロンプトで音声対話向けの生成長に制限する
-  - `Pipeline.time_delay=2.5` で、通常の高速応答では filler phrase を抑えつつ、遅い RAG 応答では「確認しています」を早めに返す
+  - `Pipeline.time_delay=1.0` で、LLM の最初の文字が 1.0 秒以内に来ないときだけ「そうですね。」を返す（2026-11-13 の Swallow は 0.05〜0.36 秒、起動直後の初回は 0.84 秒）。値は使う LLM の TTFT の p95 より上にする
   - `ASR language=ja-JP`
   - `ASR model=nvidia/nemotron-3.5-asr-streaming-0.6b`
   - `TTS processor=RivaTTSService`
@@ -74,5 +74,4 @@ Hosted NIM を使う場合、`manage_tokkio.sh start|stop|restart` で local LLM
 
 - `RivaASRService.model` は `nvidia/nemotron-3.5-asr-streaming-0.6b` に固定しています。接続先の Riva / Speech NIM 側でも同じ ASR model id が利用できる状態にしてください
 - `ElevenLabs` を使い続けたい場合は `Pipeline.tts_processor` を `ElevenLabsTTSService` に戻し、`ElevenLabsTTSService.voice_id` に日本語対応 voice id を設定してください
-- この repo の `infra/compose/check_nim_stack.py` は既に `ja-JP` と `Magpie-Multilingual.JA-JP.Aria.Neutral` を既定にしているので、日本語 Speech NIM の疎通確認に使えます
 - Hosted NIM / local LLM の検証は `infra/llm/check_llm_endpoint.py` を使います

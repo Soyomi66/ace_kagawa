@@ -1,0 +1,7 @@
+# vllm/vllm-openai:v0.32.0-cu129 with torchcodec removed.
+# The image ships torch 2.13.0+cu129 but torchcodec 0.17.0 built for CUDA 13, so loading a
+# multimodal model such as Gemma 4 fails with "libnvrtc.so.13: cannot open shared object file".
+# Text-only serving does not need torchcodec; the 2026-10-28 comparison ran without it too.
+ARG VLLM_BASE_IMAGE=vllm/vllm-openai:v0.32.0-cu129
+FROM ${VLLM_BASE_IMAGE}
+RUN pip uninstall -y torchcodec

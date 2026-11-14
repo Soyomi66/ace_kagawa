@@ -507,6 +507,92 @@ class OperatorStopCueTests(unittest.TestCase):
         asyncio.run(Harness()._process_context_common(context, unexpected_stream))
 
 
+class FirstClauseTests(unittest.TestCase):
+    """The first comma of a reply ends a segment, so TTS can start before 。."""
+
+    def first_clause_stream(self, text: str) -> list[list[str]]:
+        return [
+            stream(deltas, first_clause_min_chars=tokkio_llm.FIRST_CLAUSE_MIN_CHARS)
+            for _, deltas in chunkings(text)
+        ]
+
+    def test_first_clause_is_its_own_segment_for_every_chunking(self) -> None:
+        text = "東京工科大学へは、八王子駅からバスで約10分です。"
+        for segments in self.first_clause_stream(text):
+            self.assertEqual(segments, ["東京工科大学へは、", "八王子駅からバスで約10分です。"])
+
+    def test_only_the_first_clause_is_cut_early(self) -> None:
+        text = "東京工科大学は、八王子市にあり、駅からバスで行けます。次に学部です。"
+        for segments in self.first_clause_stream(text):
+            self.assertEqual(
+                segments,
+                ["東京工科大学は、", "八王子市にあり、駅からバスで行けます。", "次に学部です。"],
+            )
+
+    def test_short_lead_in_stays_with_its_sentence(self) -> None:
+        for segments in self.first_clause_stream("はい、八王子キャンパスにあります。"):
+            self.assertEqual(segments, ["はい、八王子キャンパスにあります。"])
+
+    def test_thousands_separator_is_not_a_clause_end(self) -> None:
+        for segments in self.first_clause_stream("学生数は約1,500人で、多くの学部があります。"):
+            self.assertEqual(segments, ["学生数は約1,500人で、", "多くの学部があります。"])
+
+    def test_sentence_before_any_comma_is_the_first_segment(self) -> None:
+        for segments in self.first_clause_stream("八王子にあります。駅からは、バスで行けます。"):
+            self.assertEqual(segments, ["八王子にあります。", "駅からは、バスで行けます。"])
+
+    def test_ascii_comma_waits_for_the_next_delta_and_keeps_its_space(self) -> None:
+        buffer = tokkio_llm.SpeechSegmentBuffer(first_clause_min_chars=tokkio_llm.FIRST_CLAUSE_MIN_CHARS)
+        self.assertEqual(buffer.feed("Hello,"), [])
+        self.assertEqual(buffer.feed(" world"), ["Hello, "])
+        self.assertEqual(buffer.flush(), ["world"])
+
+    def test_buffer_without_the_option_keeps_the_clause(self) -> None:
+        self.assertEqual(
+            stream(list("東京工科大学へは、八王子駅からです。")),
+            ["東京工科大学へは、八王子駅からです。"],
+        )
+
+    def test_llm_service_pushes_the_first_clause_as_its_own_text_frame(self) -> None:
+        frames: list = []
+
+        class Harness(tokkio_llm.TokkioLLMServiceMixin):
+            filler: list[str] = []
+            time_delay = 60.0
+            first_response_timeout_s = 5.0
+
+            async def start_ttfb_metrics(self) -> None:
+                pass
+
+            async def stop_ttfb_metrics(self) -> None:
+                pass
+
+            async def push_frame(self, frame) -> None:
+                frames.append(frame)
+
+        async def chunks():
+            for delta in ["東京工科大学へは", "、八王子駅", "からバスです。"]:
+                yield types.SimpleNamespace(content=delta)
+
+        async def stream_chat_completions(_context):
+            return chunks()
+
+        context = types.SimpleNamespace(
+            get_messages=lambda: [{"role": "user", "content": "東京工科大学への行き方を教えてください。"}]
+        )
+        asyncio.run(Harness()._process_context_common(context, stream_chat_completions))
+
+        self.assertEqual(
+            [(type(frame).__name__, frame.content) for frame in frames],
+            [
+                ("LLMFullResponseStartFrame", ""),
+                ("TextFrame", "東京工科大学へは、"),
+                ("TextFrame", "八王子駅からバスです。"),
+                ("LLMFullResponseEndFrame", ""),
+            ],
+        )
+
+
 class LLMStreamErrorTests(unittest.TestCase):
     """A stream that fails mid-response still speaks the sentence the buffer held."""
 

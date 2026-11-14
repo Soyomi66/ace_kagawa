@@ -64,6 +64,8 @@ class TokkioIrodoriLifecycleTests(unittest.TestCase):
         self.assertIn("/app/src", script)
         self.assertIn("Publishing the verified controller bundle", script)
         self.assertIn("tokkio_irodori_tts.py", script)
+        self.assertIn("tokkio_speechcpp_stt.py", script)
+        self.assertEqual(script.count("tokkio_turn.py"), 2)
 
     def test_manage_script_does_not_control_local_llm_lifecycle(self) -> None:
         script = (ROOT / "infra" / "tokkio" / "manage_tokkio.sh").read_text(encoding="utf-8")
@@ -82,11 +84,6 @@ class TokkioIrodoriLifecycleTests(unittest.TestCase):
         self.assertIn("rebuild_app_workload_replicas_from_helm_manifest", script)
         self.assertIn("TOKKIO_HELM_RELEASE", script)
         self.assertIn("helm get manifest", script)
-
-    def test_llm_compose_file_uses_configurable_container_name(self) -> None:
-        compose_text = (ROOT / "infra" / "llm" / "docker-compose.trtllm.yml").read_text(encoding="utf-8")
-
-        self.assertIn("container_name: ${TRTLLM_CONTAINER_NAME:-ace-trtllm-osaka-swallow}", compose_text)
 
 
 if __name__ == "__main__":

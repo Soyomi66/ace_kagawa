@@ -1,0 +1,36 @@
+[Unit]
+Description=ACE speech.cpp ASR (Haas-ja-v1.0, Japanese) for Tokkio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kyano
+Group=kyano
+# Official Linux x64 Vulkan release 0.10.1 (speech-0.10.1-linux-x64-vulkan.zip, sha256 187d6398...);
+# the speech binary in it is sha256 bb9569ed.... Haas needs 0.9.4 or later.
+Environment=SPEECHCPP_ASR_BIN=/data/ACE/speech-cpp/runtime/v0.10.1/release/speech
+# sakasegawa/Haas-ja-v1.0-GGUF revision 6b965d5, Q8_0; a path, so starting never fetches.
+# Its server id is Haas-ja-v1.0, which SpeechCppSTTService.model must match.
+Environment=SPEECHCPP_ASR_MODEL=/data/ACE/speech-cpp/models/sakasegawa--Haas-ja-v1.0-GGUF/6b965d5/Haas-616M-ja-v1.0-Q8_0.gguf
+# Silero VAD v6.2 for chunking_strategy=auto, which SpeechCppSTTService sends (noise comes back empty).
+Environment=SPEECHCPP_ASR_VAD_MODEL=/data/ACE/speech-cpp/models/sakasegawa--silero-vad-GGUF/2fc312514e5fc4fa4ffd02b25c76a4853fa4130e8fb9777d01502183b01238cb/silero-vad-309K-v6.2-F32.gguf
+# Custom vocabulary: Haas writes 青嵐 in 14/16 questions with it and 2/16 without (docs/audits/speech-cpp-asr-haas-2026-11-02.md).
+# Keep it to a few words: more of them write listed words into distant speech.
+Environment=SPEECHCPP_ASR_KEYWORDS=青嵐=せいらん,セイラン
+# Vulkan1 is nvidia-smi GPU 0 on this host, with Riva, vLLM and the Irodori TTS (0.7 GiB here).
+# The wrapper stops the server if it lands on another GPU.
+Environment=SPEECHCPP_ASR_DEVICE=Vulkan1
+Environment=SPEECHCPP_ASR_GPU_UUID=GPU-d4c17c05-f87d-de54-7fdc-adf8c1dc6f16
+Environment=SPEECHCPP_ASR_THREADS=4
+# The controller pod calls http://10.209.1.12:8024/v1. speech serve has no authentication.
+Environment=SPEECHCPP_ASR_HOST=0.0.0.0
+Environment=SPEECHCPP_ASR_PORT=8024
+ExecStart=/home/kyano/workspace/ACE/ace_kagawa/infra/asr/run_speechcpp_asr.sh
+# The wrapper answers systemd's SIGTERM with exit 143 once the server is down; a stop is not a failure.
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

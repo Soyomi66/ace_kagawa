@@ -379,6 +379,23 @@ def build_generated_env(values: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def conversation_switch_args(values: dict[str, str]) -> list[str]:
+    """customize_tokkio_japanese.py arguments for the conversation switches.
+
+    TOKKIO_TURN_END (vad / text) and TOKKIO_BARGE_IN (immediate / gated) select tokkio_turn.py's
+    behaviours and are off when unset; TOKKIO_SPOKEN_STYLE adds the spoken-style block to the
+    persona prompt and is on when unset.
+    """
+    return [
+        "--turn-end",
+        values.get("TOKKIO_TURN_END", "").strip() or "vad",
+        "--barge-in",
+        values.get("TOKKIO_BARGE_IN", "").strip() or "immediate",
+        "--spoken-style",
+        "true" if is_enabled(values, "TOKKIO_SPOKEN_STYLE", default=True) else "false",
+    ]
+
+
 def maybe_apply_japanese_customization(
     values: dict[str, str],
     ace_repo_dir: Path,
@@ -456,12 +473,36 @@ def maybe_apply_japanese_customization(
             str(rag_settings.local_top_k),
             "--local-rag-max-context-chars",
             str(rag_settings.local_max_context_chars),
+            *conversation_switch_args(values),
         ],
         check=True,
     )
     result["applied"] = True
     result["reason"] = "patched"
     return result
+
+
+def sync_web_search_key(values: dict[str, str], generated_dir: Path) -> dict[str, str | bool]:
+    """Write the Exa key into the generated dir (git-ignored, mode 600), or remove it.
+
+    manage_tokkio.sh sync-controller copies the file to /code/configs/exa_api_key in
+    the controller pod; tokkio_rag.py enables web search only when that file exists.
+    TOKKIO_WEB_SEARCH=off keeps the key unused.
+    """
+
+    key_path = generated_dir / "exa_api_key"
+    api_key = values.get("TOKKIO_EXA_API_KEY", "").strip()
+    enabled = bool(api_key) and is_enabled(values, "TOKKIO_WEB_SEARCH", default=True)
+    if not enabled:
+        key_path.unlink(missing_ok=True)
+        return {"enabled": False, "provider": "", "reason": "no_key" if not api_key else "disabled_by_env"}
+    tmp_path = key_path.with_name(f".{key_path.name}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(api_key + "\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, key_path)
+    return {"enabled": True, "provider": "exa", "reason": ""}
 
 
 def main() -> int:
@@ -503,6 +544,7 @@ def main() -> int:
     rag_settings = resolve_rag_settings(values)
     local_rag_freshness = verify_local_rag_index(rag_settings)
     japanese_customization = maybe_apply_japanese_customization(values, ace_repo_dir)
+    web_search = sync_web_search_key(values, generated_dir)
     manifest = {
         "env_file": str(env_path),
         "workspace_dir": str(workspace_dir),
@@ -518,6 +560,7 @@ def main() -> int:
             "api_key_env": "NVIDIA_LLM_API_KEY",
         },
         "japanese_customization": japanese_customization,
+        "web_search": web_search,
         "irodori_tts": {
             "enabled": irodori_tts_settings.enabled,
             "base_url": irodori_tts_settings.base_url,

@@ -1,0 +1,31 @@
+[Unit]
+Description=ACE speech.cpp ASR (Qwen3-ASR-1.7B, English mode) for Tokkio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kyano
+Group=kyano
+# Haas, the Japanese unit's model, takes Japanese only (language=en is a 400), so the
+# English mode (TOKKIO_TTS_PROCESSOR=QwenTTSService) keeps Qwen3-ASR on its own port.
+# Official Linux x64 Vulkan release 0.10.1, as the Japanese unit.
+Environment=SPEECHCPP_ASR_BIN=/data/ACE/speech-cpp/runtime/v0.10.1/release/speech
+# The catalog's qwen3-asr-1.7b (Q8_0), sha256 5f219b78a1d9c3b9...; a path, so starting never fetches.
+# Its server id is Qwen3-ASR-1.7B, which the English mode's SpeechCppSTTService.model must match.
+Environment=SPEECHCPP_ASR_MODEL=/data/ACE/speech-cpp/models/sakasegawa--Qwen3-ASR-1.7B-GGUF/5f219b78a1d9c3b9e97da27708b36f8a0bc1bfc1650b541c0a6dbaf87c9a62d0/Qwen3-ASR-1.7B-Q8_0.gguf
+# Vulkan1 is nvidia-smi GPU 0 on this host (2.3 GiB here). The wrapper stops the server if it lands on another GPU.
+Environment=SPEECHCPP_ASR_DEVICE=Vulkan1
+Environment=SPEECHCPP_ASR_GPU_UUID=GPU-d4c17c05-f87d-de54-7fdc-adf8c1dc6f16
+Environment=SPEECHCPP_ASR_THREADS=4
+# The controller pod calls http://10.209.1.12:8025/v1 in the English mode. speech serve has no authentication.
+Environment=SPEECHCPP_ASR_HOST=0.0.0.0
+Environment=SPEECHCPP_ASR_PORT=8025
+ExecStart=/home/kyano/workspace/ACE/ace_kagawa/infra/asr/run_speechcpp_asr.sh
+# The wrapper answers systemd's SIGTERM with exit 143 once the server is down; a stop is not a failure.
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
