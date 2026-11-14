@@ -1,6 +1,6 @@
-# ACE Linux RTX Sandbox
+# ACE Kagawa (Tokkio 5.0)
 
-Linux RTX 上で NVIDIA ACE 系の digital human 構成を試すためのリポジトリです。現在の主経路は `Tokkio 5.0` を使った `browser-first / Kubernetes / multi-service` 構成で、既存の `Audio2Face + MetaHuman + ASR/LLM/TTS` 直結サンドボックスは Unreal 中心の研究用サブパスとして残しています。
+Linux RTX 上で NVIDIA ACE 系の digital human 構成を試すためのリポジトリです。主経路は `Tokkio 5.0` を使った `browser-first / Kubernetes / multi-service` 構成です。Tokkio を使わないローカル経路は `infra/local_avatar` にあります。Unreal 直結の研究用サンドボックス（`services/orchestrator`、`infra/compose`、`unreal`）は 2026-11-14 に削除しました。必要なときは Git の履歴（コミット `d68e6b6` 以前）から取り出せます。
 
 大きなキャッシュ、生成音声、Docker bind mount、UE の重い生成物は repo の外に置きます。LLM の model / cache / engine は `/data/ACE` 配下に置き、repo 側からは `./data` symlink で参照します。Tokkio の作業ディレクトリは `infra/tokkio/workspace` に置きますが、Git 管理外です。既定の音声・Tokkio 補助用外部永続領域は `/home2/ko66/ace-sandbox` です。
 
@@ -8,11 +8,8 @@ Linux RTX 上で NVIDIA ACE 系の digital human 構成を試すためのリポ�
 
 - `docs/architecture/tokkio-reference-stack.md`: Tokkio 5.0 を主系にした構成メモ
 - `infra/tokkio`: Tokkio one-click deployment 用の前提チェック、環境変数雛形、実行ラッパ
-- `infra/llm`: LLM NIM / OpenAI 互換 endpoint 検証と、任意の local TensorRT-LLM 補助手順
-- `docs/architecture/ace-sandbox.md`: 全体アーキテクチャ、状態遷移、WebSocket プロトコル、運用前提
-- `infra/compose/docker-compose.yml`: `GPU1` に固定した ASR/TTS NIM 起動雛形
-- `services/orchestrator`: FastAPI + asyncio ベースの half-duplex 会話オーケストレータ
-- `unreal/Plugins/ACEConversation`: UE 5.6 プロジェクトへ組み込むための C++ コンポーネント雛形
+- `infra/llm`: LLM NIM / OpenAI 互換 endpoint 検証と、ローカル vLLM（Gemma 4）の compose
+- `infra/rag`、`infra/tts`、`infra/asr`、`infra/local_avatar`: ローカル RAG、Irodori-TTS、speech.cpp の音声認識、Tokkio なしの経路
 
 ## Persistent Directories
 
@@ -40,7 +37,7 @@ python3 infra/llm/check_llm_endpoint.py \
   --model nvidia/nemotron-3-ultra-550b-a55b
 ```
 
-ローカル TensorRT-LLM で Osaka-Swallow を出す旧経路は、研究用の任意サブパスとして `infra/llm/README.md` に残しています。
+ローカルの vLLM で Gemma 4 を動かす手順は `infra/llm/README.md` にあります。
 
 ## RAG
 
@@ -87,55 +84,10 @@ python3 infra/tokkio/check_tokkio_endpoints.py --insecure --kubectl --ui-url htt
 
 詳細は `infra/tokkio/README.md` と `docs/architecture/tokkio-reference-stack.md` にまとめています。
 
-## Unreal-Centric Sandbox
-
-以下は Tokkio ではなく、Unreal 直結の研究用サンドボックスです。
-
-### Speech NIM
-
-1. `infra/compose/.env.example` を `infra/compose/.env` にコピーして、NGC とイメージ名を埋めます。
-2. 起動します。
-
-```bash
-docker compose --env-file infra/compose/.env -f infra/compose/docker-compose.yml up -d
-```
-
-ASR は host の `50051/9000`、TTS は `50052/9001` を使う前提です。
-
-### Orchestrator
-
-```bash
-cd services/orchestrator
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-cp .env.example .env
-python3 tools/init_storage.py
-uvicorn app.main:app --host 0.0.0.0 --port 8080
-```
-
-`ACE_NIM_API_KEY`、Speech NIM の接続先を `.env` で調整してください。LLM は既定で `https://integrate.api.nvidia.com/v1` の `stockmark/stockmark-2-100b-instruct` を使い、起動時に `/v1/models` でモデル存在確認を行います。
-
-起動後は `GET /status` で外部依存を含む状態確認ができます。モックモードの疎通確認には `services/orchestrator/tools/demo_client.py` を使えます。
-
-### Unreal
-
-`unreal/README.md` に組み込み手順をまとめています。重要なポイントは次のとおりです。
-
-- UE 5.6 の C++ プロジェクトを作成する
-- MetaHuman と ACE Unreal Plugin を入れる
-- `Face_AnimBP` に `Apply ACE Face Animations` を追加する
-- `mh_arkit_mapping_pose_A2F` を使う
-- `Mouth Close` の既定カーブ干渉を無効化する
-- `ConversationBridgeComponent` で WebSocket と PCM の受け渡しを接続する
-- `ACEAudioPlaybackComponent` で受信 PCM を `USoundWaveProcedural` へ流す
-
 ## Verification
 
-Tokkio の確認は `infra/tokkio/check_tokkio_endpoints.py` を使います。Unreal 中心のサンドボックスを確認する場合は、依存が入った環境で以下を順に確認します。
+Tokkio の確認は `infra/tokkio/check_tokkio_endpoints.py`、LLM の確認は `infra/llm/check_llm_endpoint.py` を使います。テストは次のコマンドで実行します。
 
 ```bash
-python3 -m unittest discover -s services/orchestrator/tests
-python3 services/orchestrator/tools/demo_client.py --url ws://127.0.0.1:8080/ws/session --mock-audio
-curl -s http://127.0.0.1:8080/status
+python3 -m unittest discover -s infra/tests -p "test_*.py"
 ```

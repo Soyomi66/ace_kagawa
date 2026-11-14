@@ -74,5 +74,4 @@ Hosted NIM を使う場合、`manage_tokkio.sh start|stop|restart` で local LLM
 
 - `RivaASRService.model` は `nvidia/nemotron-3.5-asr-streaming-0.6b` に固定しています。接続先の Riva / Speech NIM 側でも同じ ASR model id が利用できる状態にしてください
 - `ElevenLabs` を使い続けたい場合は `Pipeline.tts_processor` を `ElevenLabsTTSService` に戻し、`ElevenLabsTTSService.voice_id` に日本語対応 voice id を設定してください
-- この repo の `infra/compose/check_nim_stack.py` は既に `ja-JP` と `Magpie-Multilingual.JA-JP.Aria.Neutral` を既定にしているので、日本語 Speech NIM の疎通確認に使えます
 - Hosted NIM / local LLM の検証は `infra/llm/check_llm_endpoint.py` を使います
