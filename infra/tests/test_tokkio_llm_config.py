@@ -751,6 +751,9 @@ class TokkioLlmConfigTests(unittest.TestCase):
             "山田さんはどこにいますか",
             "佐藤教授の研究室はどこですか",
             "私の電話番号は09012345678です",
+            "090-1234-5678に天気を教えてください",
+            "０９０ １２３４ ５６７８の天気はどうですか",
+            "娘の学校の天気はどうですか",
             # Questions to the persona without a subject.
             "趣味は何ですか",
             "どこの出身ですか",

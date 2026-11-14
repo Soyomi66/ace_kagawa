@@ -35,8 +35,11 @@ UNIVERSITY_NAME = "東京工科大学"
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
 _PERSONA_RE = re.compile(r"あなた|香川|学長|先生")
 _HONORIFIC_NAME_RE = re.compile(r"[一-龥々ァ-ヶー]{1,8}(?:さん|くん|ちゃん|様|さま|氏|教授|准教授|講師|博士)")
+# Digits count through separators (090-1234-5678, 090 1234 5678), and a family member's
+# details are as personal as the speaker's own.
 _PERSONAL_DETAIL_RE = re.compile(
-    r"\d{7,}|[\w.+-]+@[\w-]+\.[\w.]+|住所|電話番号|メールアドレス|(?:私|わたし|僕|ぼく|俺|おれ|うち)の"
+    r"(?:\d[\s\-‐－ー―.()（）]*){7,}|[\w.+-]+@[\w-]+\.[\w.]+|住所|電話番号|メールアドレス|郵便番号|生年月日|口座|暗証番号|パスワード"
+    r"|(?:私|わたし|わたくし|あたし|僕|ぼく|俺|おれ|うち|自分|息子|娘|子供|子ども|夫|妻|主人|家内|父|母|兄|弟|姉|妹|彼氏|彼女|友達|友人)の"
 )
 _WEATHER_RE = re.compile(r"天気|気温|降水|雨予報|台風")
 _DEFINITION_RE = re.compile(
