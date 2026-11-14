@@ -23,16 +23,23 @@ from pipecat.services.openai.llm import OpenAILLMService
 _STRIP_CHARS_RE = re.compile(r"[\s　。、．.，,！？!?？!…・「」『』（）()\[\]【】]+")
 _SENTENCE_END_CHARS = "。.!?！？"
 _SOFT_BREAK_CHARS = "、，,;； "
+_FIRST_CLAUSE_BREAK_CHARS = "、，,"
+# Letters/digits a reply must speak before its first comma can start TTS, so
+# "あ、" / "はい、" stay with their sentence (same rule as infra/local_avatar).
+FIRST_CLAUSE_MIN_CHARS = 4
 _CLOSING_BRACKET_CHARS = "」』）)】〉》］]”\""
 _NEMOTRON_MODELS_WITH_THINKING = (
     "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
 )
+# Served names of Gemma 4 on the local vLLM (infra/llm/docker-compose.gemma4-12b.yml, gemma-4-12b-it;
+# infra/llm/docker-compose.gemma4-26b-a4b.yml, gemma-4-26b-a4b-it). Every size shares one sampling.
+_GEMMA4_MODEL_MARKERS = ("gemma-4", "gemma4")
 _DEFAULT_FIRST_RESPONSE_TIMEOUT_S = 20.0
 _LLM_RESOURCE_RETRY_DELAY_S = 0.75
-_LLM_TIMEOUT_REPLY = "回答サービスの応答に時間がかかっています。少し待ってから、もう一度お尋ねください。"
-_LLM_ERROR_REPLY = "回答サービスへ接続できません。少し待ってから、もう一度お尋ねください。"
-_LLM_BUSY_REPLY = "回答サービスが混み合っています。少し待ってから、もう一度お尋ねください。"
+_LLM_TIMEOUT_REPLY = "すみません、少し考え込んでしまいました。もう一度聞いてもらえますか。"
+_LLM_ERROR_REPLY = "すみません、いまうまく答えられない状態です。少し待ってから、もう一度お願いします。"
+_LLM_BUSY_REPLY = "すみません、いま少し立て込んでいます。少し待ってから、もう一度お願いします。"
 _SPEECH_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _SPEECH_HEADING_RE = re.compile(r"(^|\s+)\*\*([^*\n]{1,40})\*\*(?=\s*(?:[*+]|$))")
 # "→" / "⇒" are read as a pause instead of being deleted ("A→B" must not become "AB").
@@ -153,14 +160,15 @@ _OPEN_CAMPUS_CLOSING_CUE_RE = re.compile(
     rf"(?:締め(?:の(?:言葉|{_CUE_GREETING_NOUN}|台本))?|クロージング|最後の{_CUE_GREETING_NOUN}){_CUE_REQUEST}"
 )
 
+# A greeting gets a greeting and a word of welcome, not an echo.
 _GREETING_REPLIES = {
-    "おはよう": "おはようございます。",
-    "おはようございます": "おはようございます。",
-    "こんにちは": "こんにちは。",
-    "こんばんは": "こんばんは。",
-    "はじめまして": "はじめまして。香川豊です。",
-    "よろしくお願いします": "よろしくお願いします。",
-    "よろしくおねがいします": "よろしくお願いします。",
+    "おはよう": "おはようございます。お会いできてうれしいです。",
+    "おはようございます": "おはようございます。お会いできてうれしいです。",
+    "こんにちは": "こんにちは。お会いできてうれしいです。",
+    "こんばんは": "こんばんは。お会いできてうれしいです。",
+    "はじめまして": "はじめまして、香川豊です。お会いできてうれしいです。",
+    "よろしくお願いします": "こちらこそ、よろしくお願いします。",
+    "よろしくおねがいします": "こちらこそ、よろしくお願いします。",
     "ありがとう": "どういたしまして。",
     "ありがとうございます": "どういたしまして。",
 }
@@ -200,7 +208,23 @@ _FAST_REPLY_EXCLUDED_TERMS = (
 
 def nvidia_model_input_params(model: str) -> dict[str, object]:
     """Return stable realtime-chat parameters for model-specific NIM behavior."""
-    if model.strip() not in _NEMOTRON_MODELS_WITH_THINKING:
+    name = model.strip()
+    if any(marker in name.lower() for marker in _GEMMA4_MODEL_MARKERS):
+        # The sampling Gemma 4 was scored with (docs/audits/llm-candidates-2026-10-28.md).
+        # max_tokens only stops a runaway: a reply cut mid-sentence would still be
+        # spoken, so reply length is left to the system prompt.
+        return {
+            "temperature": 0.1,
+            "top_p": 0.95,
+            "max_tokens": 512,
+            "extra": {
+                "extra_body": {
+                    "top_k": 64,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            },
+        }
+    if name not in _NEMOTRON_MODELS_WITH_THINKING:
         return {}
     return {
         "temperature": 0.0,
@@ -241,6 +265,17 @@ def _normalize_short_utterance(text: str) -> str:
     return _STRIP_CHARS_RE.sub("", text).lower()
 
 
+# The fixed name and age replies answer only a question about the persona's own name or
+# age: あなたの会社の名前は, 香川先生の名前の由来は and あなたのお父さんは何歳ですか go to the LLM.
+_SELF_SUBJECT = r"(?:あなた|君|きみ|香川(?:豊)?(?:先生|さん|学長)?|先生|学長)"
+_QUESTION_TAIL = r"(?:は|を)?(?:何|なん|なに)?(?:ですか|でしょうか|なんですか|というんですか|教えて(?:ください)?)?"
+_SELF_NAME_QUESTION_RE = re.compile(rf"(?:{_SELF_SUBJECT}の?お?名前|お名前){_QUESTION_TAIL}")
+_SELF_AGE_QUESTION_RE = re.compile(
+    rf"{_SELF_SUBJECT}?(?:は|の|って)?(?:今|いま)?(?:年齢|何歳|おいくつ)"
+    r"(?:は|を)?(?:何歳|いくつ|おいくつ)?(?:ですか|でしょうか|なんですか|になりますか|になりましたか|教えて(?:ください)?)?"
+)
+
+
 def _is_name_question(normalized: str) -> bool:
     if len(normalized) > 40:
         return False
@@ -268,29 +303,13 @@ def _is_name_question(normalized: str) -> bool:
     }
     if normalized in exact_questions:
         return True
-
-    if ("名前" in normalized or "お名前" in normalized) and any(
-        subject in normalized for subject in ("あなた", "君", "きみ", "香川先生", "香川豊先生")
-    ):
-        return True
-
-    return False
+    return _SELF_NAME_QUESTION_RE.fullmatch(normalized) is not None
 
 
 def _is_kagawa_age_question(normalized: str) -> bool:
-    if len(normalized) > 50 or not any(term in normalized for term in ("年齢", "何歳", "おいくつ")):
+    if len(normalized) > 50:
         return False
-    if any(subject in normalized for subject in ("香川", "あなた", "君", "きみ")):
-        return True
-    if normalized.startswith("先生"):
-        return True
-    return normalized in {
-        "年齢は",
-        "年齢を教えて",
-        "何歳",
-        "何歳ですか",
-        "おいくつですか",
-    }
+    return _SELF_AGE_QUESTION_RE.fullmatch(normalized) is not None
 
 
 def _is_symposium_opening_cue(normalized: str) -> bool:
@@ -400,11 +419,19 @@ class SpeechSegmentBuffer:
         soft_max_chars: int = 28,
         hard_max_chars: int = 56,
         min_segment_chars: int = 8,
+        first_clause_min_chars: int = 0,
     ) -> None:
+        """first_clause_min_chars > 0 cuts the first segment at its first comma.
+
+        TTS can then start on that clause while the LLM is still writing the
+        rest of the sentence (IrodoriTTSService start_on_first_clause).
+        """
         self._buffer = ""
         self._soft_max_chars = soft_max_chars
         self._hard_max_chars = hard_max_chars
         self._min_segment_chars = min_segment_chars
+        self._first_clause_min_chars = first_clause_min_chars
+        self._first_clause_pending = first_clause_min_chars > 0
 
     def feed(self, text: str) -> list[str]:
         self._buffer += text
@@ -426,6 +453,13 @@ class SpeechSegmentBuffer:
         segments: list[str] = []
         while self._buffer:
             sentence_index = self._first_sentence_end_index()
+            if self._first_clause_pending and not segments:
+                clause_index = self._first_clause_break_index(sentence_index)
+                if clause_index is not None:
+                    segment = self._take(clause_index + 1)
+                    if segment:
+                        segments.append(segment)
+                    continue
             if sentence_index is not None:
                 end_index = sentence_index + 1
                 while end_index < len(self._buffer) and self._buffer[end_index] in _CLOSING_BRACKET_CHARS:
@@ -454,7 +488,23 @@ class SpeechSegmentBuffer:
                 continue
 
             break
+        if segments:
+            self._first_clause_pending = False
         return segments
+
+    def _first_clause_break_index(self, sentence_index: int | None) -> int | None:
+        end = len(self._buffer) if sentence_index is None else sentence_index
+        spoken = 0
+        for index, char in enumerate(self._buffer[:end]):
+            if (
+                char in _FIRST_CLAUSE_BREAK_CHARS
+                and spoken >= self._first_clause_min_chars
+                and not self._is_inside_token(index)
+            ):
+                # Only the next delta shows whether a space follows an ASCII comma.
+                return None if char == "," and index + 1 == len(self._buffer) else index
+            spoken += char.isalnum()
+        return None
 
     def _first_sentence_end_index(self) -> int | None:
         for index, char in enumerate(self._buffer):
@@ -606,7 +656,7 @@ class TokkioLLMServiceMixin:
                 self._open_stream_and_read_first_text_with_retry(context, stream_chat_completions),
                 timeout=self.first_response_timeout_s,
             )
-            speech_buffer = SpeechSegmentBuffer()
+            speech_buffer = SpeechSegmentBuffer(first_clause_min_chars=FIRST_CLAUSE_MIN_CHARS)
             ttfb_stopped = False
 
             elapsed_time = time.time() - start_time

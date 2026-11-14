@@ -64,6 +64,8 @@ class TokkioIrodoriLifecycleTests(unittest.TestCase):
         self.assertIn("/app/src", script)
         self.assertIn("Publishing the verified controller bundle", script)
         self.assertIn("tokkio_irodori_tts.py", script)
+        self.assertIn("tokkio_speechcpp_stt.py", script)
+        self.assertEqual(script.count("tokkio_turn.py"), 2)
 
     def test_manage_script_does_not_control_local_llm_lifecycle(self) -> None:
         script = (ROOT / "infra" / "tokkio" / "manage_tokkio.sh").read_text(encoding="utf-8")

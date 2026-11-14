@@ -12,7 +12,9 @@ audio2face-3d:
         a2f:
           # CC5 consumes the ARKit-compatible James output topology, but its
           # facial profile should not inherit the James character's stronger
-          # mouth/tongue calibration.
+          # mouth/tongue calibration. Lower-face strength and lip retraction
+          # are raised from neutral because at 0.9/1.0 the CC5 mouth barely
+          # parted on Japanese speech and the teeth hardly showed (2026-10-20).
           inference_model_id: james_v2.3
           blendshape_id: james_topo2_v2.3
           enable_tongue_blendshapes: false
@@ -20,7 +22,7 @@ audio2face-3d:
             lip_close_offset: 0.0
             lip_open_offset: 0.0
             lower_face_smoothing: 0.015
-            lower_face_strength: 0.9
+            lower_face_strength: 1.0
             skin_strength: 1.0
           blendshape_params:
             enable_clamping_bs_weight: true
@@ -36,8 +38,8 @@ audio2face-3d:
               MouthFrownRight: 1.0
               MouthFunnel: 1.0
               MouthLeft: 1.0
-              MouthLowerDownLeft: 1.0
-              MouthLowerDownRight: 1.0
+              MouthLowerDownLeft: 1.15
+              MouthLowerDownRight: 1.15
               MouthPressLeft: 1.0
               MouthPressRight: 1.0
               MouthPucker: 1.0
@@ -50,8 +52,8 @@ audio2face-3d:
               MouthSmileRight: 1.0
               MouthStretchLeft: 1.0
               MouthStretchRight: 1.0
-              MouthUpperUpLeft: 1.0
-              MouthUpperUpRight: 1.0
+              MouthUpperUpLeft: 1.1
+              MouthUpperUpRight: 1.1
               TongueOut: 0.0
 
 tokkio-app:

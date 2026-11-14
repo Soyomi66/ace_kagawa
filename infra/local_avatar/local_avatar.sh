@@ -16,6 +16,7 @@ SIGNALLING_DIR="${ROOT}/ps-signalling/SignallingWebServer"
 export LOCAL_AVATAR_RENDERER_DIR="${LOCAL_AVATAR_RENDERER_DIR:-${ROOT}/renderer/cc5_tokkio-2026-07-15}"
 STREAM_ID="${LOCAL_AVATAR_STREAM_ID:-kagawa-local}"
 LLM_URL="${LOCAL_AVATAR_LLM_URL:-http://127.0.0.1:8011/v1/models}"
+LLM_CONTAINER="${LOCAL_AVATAR_LLM_CONTAINER:-ace-vllm-gemma4-26b-a4b}"
 TTS_URL="${LOCAL_AVATAR_TTS_URL:-http://127.0.0.1:8021/healthz}"
 A2F_CONTAINER="${LOCAL_AVATAR_A2F_CONTAINER:-kagawa-local-a2f}"
 
@@ -52,7 +53,7 @@ start() {
     info "Tokkio (kubelet) is running; stop it first (infra/tokkio/manage_tokkio.sh stop)"
     exit 1
   fi
-  curl -fsS -m 5 "${LLM_URL}" >/dev/null || { info "LLM is not answering at ${LLM_URL} (docker start ace-vllm-llama31-swallow-8b)"; exit 1; }
+  curl -fsS -m 5 "${LLM_URL}" >/dev/null || { info "LLM is not answering at ${LLM_URL} (docker start ${LLM_CONTAINER})"; exit 1; }
   curl -fsS -m 5 "${TTS_URL}" >/dev/null || { info "TTS is not answering at ${TTS_URL} (sudo systemctl start ace-irodori-tts)"; exit 1; }
 
   if ! docker ps --format '{{.Names}}' | grep -qx "${A2F_CONTAINER}"; then

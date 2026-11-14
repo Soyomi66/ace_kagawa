@@ -397,15 +397,15 @@ class RagToolTests(unittest.TestCase):
             )
             self.assertEqual(
                 local_rag.grounded_direct_reply("大学院入試の選抜方法を教えてください", hits),
-                "大学院入試の選抜方法は研究科・課程で異なります。研究科名と課程を指定してください。",
+                "大学院入試の選抜方法は研究科と課程で違います。どの研究科のどの課程ですか。",
             )
             self.assertEqual(
                 local_rag.grounded_direct_reply("大学院入試の出願資格を教えてください", hits),
-                "大学院入試の出願資格は研究科・課程で異なります。研究科名と課程を指定してください。",
+                "大学院入試の出願資格は研究科と課程で違います。どの研究科のどの課程ですか。",
             )
             self.assertEqual(
                 local_rag.grounded_direct_reply("大学院の学費について教えてください", hits),
-                "現在の参照情報では、大学院の学費の正確な金額を確認できません。",
+                "大学院の学費の正確な金額は、いま手元にないんです。大学の公式サイトで確かめてもらえますか。",
             )
             self.assertIsNone(local_rag.grounded_direct_reply("大学院の専攻を教えて", hits))
 
@@ -520,8 +520,14 @@ class RagToolTests(unittest.TestCase):
         )
         self.assertEqual(
             local_rag.grounded_direct_reply("香川先生について教えてください", [profile_hit]),
-            "香川豊は東京工科大学の学長・教授で、セラミックス複合材料センター長です。",
+            "私は東京工科大学の学長で、片柳研究所の教授とセラミックス複合材料センター長も務めています。",
         )
+        # 家族 is the topic here, not the post: no fixed reply about the post.
+        self.assertNotIn("current_role", local_rag.classify_query("香川先生の家族について教えてください").intents)
+        self.assertIsNone(local_rag.grounded_direct_reply("香川先生の家族について教えてください", [profile_hit]))
+        # 誰ですか about someone else is not a question about Kagawa's post.
+        self.assertIsNone(local_rag.grounded_direct_reply("東京工科大学を作った人は誰ですか", [profile_hit]))
+        self.assertIsNotNone(local_rag.grounded_direct_reply("東京工科大学の学長は誰ですか", [profile_hit]))
 
     def test_local_rag_prefers_matching_kagawa_research_publication_and_career_sections(self) -> None:
         local_rag = load_module("local_rag_intent_test", ROOT / "infra" / "rag" / "local_rag.py")
@@ -958,6 +964,171 @@ class RagToolTests(unittest.TestCase):
         self.assertEqual(local_rag.classify_query(resolved).domain, "kagawa_research")
         self.assertEqual(weather, "今日の天気を教えてください")
 
+    def test_short_questions_without_a_topic_follow_the_previous_topic(self) -> None:
+        local_rag = load_module("local_rag_followup_topic_test", ROOT / "infra" / "rag" / "local_rag.py")
+        resolve = local_rag.resolve_conversation_query
+        open_campus = "オープンキャンパスについて教えてください"
+
+        # The pairs from the 2026-10-17 audit that fell through to the plain LLM.
+        for followup in (
+            "いつやるか教えてほしいです。",
+            "いつですか。",
+            "場所はどこですか。",
+            "参加方法を教えてください。",
+            "それって難しいんですか。",
+        ):
+            with self.subTest(followup=followup):
+                resolved = resolve([open_campus, followup])
+                self.assertEqual(resolved, f"{open_campus}\nフォローアップ: {followup}")
+                self.assertEqual(local_rag.classify_query(resolved).domain, "open_campus")
+
+        # Follow-ups in a row keep the topic, and one reaction may sit in between.
+        chain = [open_campus, "いつですか。", "場所はどこですか。", "参加方法を教えてください。"]
+        self.assertTrue(resolve(chain).startswith(open_campus))
+        self.assertTrue(resolve(["青嵐について教えてください", "すごいですね", "GPUは何基ですか"]).startswith("青嵐"))
+
+        # Reactions, the visitor's own topics and questions to the persona start no follow-up.
+        for other in (
+            "へえ、そうなんですか",
+            "そうなんですね",
+            "なるほど",
+            "ありがとうございました",
+            "すごいですね",
+            "今日は寒いですね",
+            "進路に迷っています",
+            "先生は何が好きですか",
+            "富士山の高さは何メートルですか",
+        ):
+            with self.subTest(other=other):
+                self.assertEqual(resolve([open_campus, other]), other)
+
+        # After two turns about something else the old topic is no longer meant.
+        self.assertEqual(
+            resolve([open_campus, "今日は寒いですね", "進路に迷っています", "それはいつですか"]),
+            "それはいつですか",
+        )
+        # No routed topic before it: the question stays as it is.
+        self.assertEqual(resolve(["こんにちは", "場所はどこですか。"]), "場所はどこですか。")
+        # Pointing back without asking is a reaction.
+        self.assertEqual(resolve([open_campus, "それはすごいですね"]), "それはすごいですね")
+
+    def test_answers_to_the_avatars_own_question_keep_the_visitors_question(self) -> None:
+        local_rag = load_module("local_rag_clarification_test", ROOT / "infra" / "rag" / "local_rag.py")
+        resolve = local_rag.resolve_conversation_query
+
+        # 「どちらのキャンパスですか」 / 「どの研究科ですか」 are asked by grounded_direct_reply().
+        resolved = resolve(["アクセスを教えてください", "八王子です"])
+        self.assertEqual(resolved, "アクセスを教えてください\nフォローアップ: 八王子です")
+        self.assertEqual(local_rag.classify_query(resolved).domain, "access")
+        self.assertTrue(
+            resolve(["大学院入試の出願期間を教えてください", "工学研究科です"]).startswith("大学院入試の出願期間")
+        )
+        # A campus question without a campus is about the campus of the turn before.
+        self.assertEqual(
+            resolve(["八王子キャンパスへの行き方を教えてください", "バスで何分ですか"]),
+            "八王子キャンパスへの行き方を教えてください\nフォローアップ: バスで何分ですか",
+        )
+        self.assertEqual(resolve(["こんにちは", "八王子です"]), "八王子です")
+        self.assertEqual(resolve(["学費を教えてください", "バスで何分ですか"]), "バスで何分ですか")
+
+    def test_fixed_reply_is_not_repeated_for_a_followup_it_does_not_answer(self) -> None:
+        local_rag = load_module("local_rag_direct_reply_turn_test", ROOT / "infra" / "rag" / "local_rag.py")
+
+        def hit(record_type: str, chunk_id: str, text: str) -> object:
+            return local_rag.LocalRagHit(
+                path="corpus.md",
+                title="corpus",
+                section_title=chunk_id,
+                source_title=chunk_id,
+                source_url="https://example.invalid",
+                publisher="",
+                published_date="",
+                accessed_date="",
+                source_type="",
+                source_priority="P1",
+                record_type=record_type,
+                chunk_id=chunk_id,
+                keywords="",
+                chunk_index=0,
+                text=text,
+                score=100.0,
+            )
+
+        access = [hit("access", "chunk_access_hachioji", "八王子キャンパスへは、八王子駅からスクールバスで約10分です。")]
+        reply_for_turn = local_rag.grounded_direct_reply_for_turn
+        first = "八王子キャンパスへの行き方を教えてください"
+        self.assertEqual(reply_for_turn(first, access), access[0].text)
+        # The follow-up would get the sentence the visitor has just heard: the LLM answers instead.
+        self.assertIsNone(reply_for_turn(f"{first}\nフォローアップ: バスで何分ですか", access))
+        # Here the follow-up is what selects the reply.
+        self.assertEqual(reply_for_turn("アクセスを教えてください\nフォローアップ: 八王子です", access), access[0].text)
+
+    def test_ungrounded_note_tells_the_llm_what_not_to_make_up(self) -> None:
+        local_rag = load_module("local_rag_ungrounded_note_test", ROOT / "infra" / "rag" / "local_rag.py")
+
+        def note(domain: str, reason: str) -> str:
+            return local_rag.ungrounded_prompt_note(
+                local_rag.LocalRagAssessment(True, False, domain, 0.0, reason, ())
+            )
+
+        person = note("university", "unknown_person:田中")
+        self.assertIn("「田中」という方", person)
+        self.assertIn("推測せず", person)
+        own = note("kagawa_research", "query_content_not_found:趣味")
+        self.assertEqual(own, local_rag.UNGROUNDED_SELF_PROMPT_NOTE)
+        self.assertIn("本人の事実として作らず", own)
+        self.assertIn("AIアバターだと隠さずに", own)
+        university = note("university", "query_content_not_found:偏差値")
+        self.assertEqual(university, local_rag.UNGROUNDED_UNIVERSITY_PROMPT_NOTE)
+        self.assertEqual(note("admissions", "score_below_threshold"), university)
+        self.assertIn("数値、日程、制度、施設、人名、実績は推測で答えず", university)
+        for text in (person, own, university, local_rag.OUTSIDE_CORPUS_PROMPT_NOTE):
+            # Not 参考情報: the block carries no evidence, only how to answer.
+            self.assertTrue(text.startswith("回答メモ: "))
+
+    def test_prompt_context_drops_sources_that_miss_the_asked_topic(self) -> None:
+        local_rag = load_module("local_rag_on_topic_sources_test", ROOT / "infra" / "rag" / "local_rag.py")
+
+        def hit(chunk_id: str, text: str) -> object:
+            return local_rag.LocalRagHit(
+                path="corpus.md",
+                title="corpus",
+                chunk_index=0,
+                text=text,
+                score=100.0,
+                section_title=chunk_id,
+                source_title=chunk_id,
+                source_url="https://example.invalid",
+                publisher="",
+                published_date="",
+                accessed_date="",
+                source_type="",
+                source_priority="P1",
+                record_type="university",
+                chunk_id=chunk_id,
+                keywords="",
+                temporal_status="current_or_undated",
+            )
+
+        dormitory = hit("oc_program", "オープンキャンパスでは学生寮説明と寮見学が予定されています。")
+        seiran = hit("seiran", "青嵐は八王子キャンパスのAIテクノロジーセンターに設置されている。")
+
+        # Gemma 4 answered 寮はありますか with 「青嵐という寮」 when both sources were in the prompt.
+        prompt, included = local_rag.format_hits_for_prompt_with_sources(
+            [dormitory, seiran], query="東京工科大学に寮はありますか"
+        )
+        self.assertEqual(included, [dormitory])
+        self.assertNotIn("青嵐", prompt)
+        # No source mentions the topic, or the question names none: every source stays.
+        _, included = local_rag.format_hits_for_prompt_with_sources(
+            [dormitory, seiran], query="東京工科大学の偏差値を教えてください"
+        )
+        self.assertEqual(included, [dormitory, seiran])
+        _, included = local_rag.format_hits_for_prompt_with_sources(
+            [dormitory, seiran], query="東京工科大学について教えてください"
+        )
+        self.assertEqual(included, [dormitory, seiran])
+
     def test_query_normalization_handles_asr_faculty_name_and_japanese_year(self) -> None:
         local_rag = load_module("local_rag_query_normalization_test", ROOT / "infra" / "rag" / "local_rag.py")
 
@@ -1262,11 +1433,11 @@ class RagToolTests(unittest.TestCase):
 
         self.assertEqual(
             local_rag.grounded_direct_reply("次のオープンキャンパスはいつですか", hits, today=date(2026, 10, 8)),
-            "直近のオープンキャンパスは8月23日の八王子キャンパスで終了しており、次回の日程はまだ確認できません。",
+            "直近のオープンキャンパスは8月23日の八王子キャンパスで、もう終わっています。次回の日程はまだ分からないんです。",
         )
         self.assertEqual(
             local_rag.grounded_direct_reply("次のオープンキャンパスはいつですか", hits, today=date(2027, 1, 10)),
-            "直近のオープンキャンパスは2026年8月23日の八王子キャンパスで終了しており、次回の日程はまだ確認できません。",
+            "直近のオープンキャンパスは2026年8月23日の八王子キャンパスで、もう終わっています。次回の日程はまだ分からないんです。",
         )
         self.assertEqual(
             local_rag.grounded_direct_reply("次のオープンキャンパスはいつですか", hits, today=date(2026, 8, 10)),
@@ -1292,6 +1463,34 @@ class RagToolTests(unittest.TestCase):
         )
         self.assertNotIn("event_status=ended", upcoming_context)
         self.assertNotIn("終了済み", upcoming_context)
+
+    def test_garbled_transcript_detects_kanji_numeral_runs_only(self) -> None:
+        local_rag = load_module("local_rag_garbled_test", ROOT / "infra" / "rag" / "local_rag.py")
+
+        for text in ("千五百一二百話", "二三四五六。"):
+            with self.subTest(text=text):
+                self.assertTrue(local_rag.looks_like_garbled_transcript(text))
+        for text in (
+            "東京工科大学", "百周年記念", "名前は?", "一万円ですか", "はい", "八王子", "二十歳",
+            "三月二十日", "十月十五日", "二千二十七年", "百二十万円", "五時三十分",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(local_rag.looks_like_garbled_transcript(text))
+
+    def test_outside_corpus_note_for_university_life_questions(self) -> None:
+        local_rag = load_module("local_rag_outside_note_test", ROOT / "infra" / "rag" / "local_rag.py")
+
+        for query in ("学食はおいしいですか", "寮はありますか", "就職率はどのくらいですか", "サークルは何がありますか"):
+            with self.subTest(query=query):
+                self.assertTrue(local_rag.needs_outside_corpus_note(query))
+        for query in (
+            "あなたの専門について教えてほしいです。",
+            "香川先生は寮に住んでいましたか",
+            "こんにちは",
+            "ありがとうございました",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(local_rag.needs_outside_corpus_note(query))
 
 
 if __name__ == "__main__":

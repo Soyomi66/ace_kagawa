@@ -9,6 +9,7 @@
 """Tokkio RAG service with filler phrase support."""
 
 import asyncio
+from datetime import date
 import json
 from pathlib import Path
 import random
@@ -32,18 +33,30 @@ from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from .local_rag import (
     GENERIC_ROUTE_OUTSIDE_CORPUS_REASON,
     OUTSIDE_CORPUS_PROMPT_NOTE,
+    asks_about_campus,
     assess_local_rag_query,
     citations_for_hits,
     classify_query,
     filter_hits_for_domain,
     format_hits_for_prompt_with_sources,
-    grounded_direct_reply,
+    grounded_direct_reply_for_turn,
+    looks_like_garbled_transcript,
+    needs_outside_corpus_note,
     resolve_conversation_query,
     route_needs_corpus_check,
     search_index,
+    ungrounded_prompt_note,
     verify_index_bundle,
 )
+from .tokkio_web_search import (
+    SEARCH_BREAKER,
+    WEB_SEARCH_KEY_FILE_NAME,
+    ExaWebSearch,
+    format_web_results_for_prompt,
+    web_search_query,
+)
 from .tokkio_llm import (
+    FIRST_CLAUSE_MIN_CHARS,
     SpeechSegmentBuffer,
     TokkioNvidiaLLMService,
     get_fast_profile_reply,
@@ -51,9 +64,13 @@ from .tokkio_llm import (
 )
 
 
+# Spoken only when the grounded path itself fails (index error, empty context). A question
+# whose evidence is rejected goes to the LLM with ungrounded_prompt_note() instead.
 GROUNDED_ANSWER_UNAVAILABLE_REPLY = (
-    "現在、信頼できる参照情報を確認できないため、この質問には正確にお答えできません。"
+    "すみません、いま手元の資料をうまく引き出せなくて、正確にお答えできないんです。"
 )
+# Spoken when the transcript is a run of kanji numerals (ASR turned noise into numbers).
+ASK_AGAIN_REPLY = "すみません、うまく聞き取れませんでした。もう一度お願いできますか。"
 
 
 class _ContextMessageOverride:
@@ -233,7 +250,7 @@ class TokkioNvidiaRAGService(NvidiaRAGService):
             full_response = ""
             filler_said = False
             response_started = False
-            speech_buffer = SpeechSegmentBuffer()
+            speech_buffer = SpeechSegmentBuffer(first_clause_min_chars=FIRST_CLAUSE_MIN_CHARS)
             ttfb_stopped = False
 
             async def monitor_request_time():
@@ -360,13 +377,16 @@ class TokkioNvidiaLLMRAGRouterService(TokkioNvidiaLLMService):
             )
 
     async def _push_grounded_answer_unavailable(self, *, start_metrics: bool = True) -> None:
+        await self._push_fixed_reply(GROUNDED_ANSWER_UNAVAILABLE_REPLY, start_metrics=start_metrics)
+
+    async def _push_fixed_reply(self, text: str, *, start_metrics: bool = True) -> None:
         if start_metrics:
             await self.start_ttfb_metrics()
         await self.stop_ttfb_metrics()
         # The assistant context aggregator only records TextFrames received
         # between LLMFullResponseStartFrame and LLMFullResponseEndFrame.
         await self.push_frame(LLMFullResponseStartFrame())
-        await self.push_frame(TextFrame(GROUNDED_ANSWER_UNAVAILABLE_REPLY))
+        await self.push_frame(TextFrame(text))
         await self.push_frame(LLMFullResponseEndFrame())
 
     def _select_reranker_top_k(self, chat_details: list[dict]) -> int:
@@ -409,6 +429,57 @@ class TokkioNvidiaLLMRAGRouterService(TokkioNvidiaLLMService):
                 logger.info("RAG router selected direct LLM path: {}", assessment.reason)
                 return "outside_corpus"
         return "rag" if decision.route_candidate else "direct"
+
+    def _web_searcher(self) -> ExaWebSearch | None:
+        # Enabled by the key file sync-controller copies next to the local RAG DB
+        # (TOKKIO_EXA_API_KEY in infra/tokkio/.env); read once per service instance.
+        if not hasattr(self, "_cached_web_searcher"):
+            db_path = getattr(self, "local_db_path", "") or "/code/configs/local_rag.sqlite"
+            key_path = Path(db_path).parent / WEB_SEARCH_KEY_FILE_NAME
+            self._cached_web_searcher = ExaWebSearch.from_key_file(key_path)
+            logger.info("Web search {}", "enabled (Exa)" if self._cached_web_searcher else "disabled (no key file)")
+        return self._cached_web_searcher
+
+    async def _web_search_context(
+        self, user_text: str, *, topic_outside_corpus: bool, about_university: bool = False
+    ) -> str | None:
+        searcher = self._web_searcher()
+        if searcher is None:
+            return None
+        query = web_search_query(
+            user_text, topic_outside_corpus=topic_outside_corpus, about_university=about_university
+        )
+        if query is None:
+            return None
+        if SEARCH_BREAKER.is_open(time.time()):
+            logger.info("Web search paused after repeated failures; answering without it")
+            return None
+
+        async def say_filler_if_slow() -> None:
+            await asyncio.sleep(self.time_delay)
+            if self.filler:
+                await self.push_frame(TTSSpeakFrame(random.choice(self.filler)))
+
+        filler_task = asyncio.create_task(say_filler_if_slow())
+        started = time.time()
+        try:
+            results = await asyncio.wait_for(searcher.search(query), timeout=searcher.timeout_s + 0.5)
+        except Exception as exc:
+            SEARCH_BREAKER.record(False, time.time())
+            logger.warning("Web search failed after {:.2f}s: {!r}", time.time() - started, exc)
+            return None
+        finally:
+            if not filler_task.done():
+                filler_task.cancel()
+                try:
+                    await filler_task
+                except asyncio.CancelledError:
+                    pass
+        SEARCH_BREAKER.record(True, time.time())
+        logger.info("Web search: query={} results={} in {:.2f}s", query, len(results), time.time() - started)
+        if not results:
+            return None
+        return format_web_results_for_prompt(results, today=date.today())
 
     def _last_user_message(self, chat_details: list[dict]) -> str:
         for message in reversed(chat_details):
@@ -470,7 +541,10 @@ class TokkioNvidiaLLMRAGRouterService(TokkioNvidiaLLMService):
                 assessment.confidence,
                 assessment.reason,
             )
-            await self._push_grounded_answer_unavailable()
+            # No evidence: the LLM answers in its own words, told what it must not make up.
+            await super()._process_context(
+                self._build_local_rag_context(context, ungrounded_prompt_note(assessment), query)
+            )
             return
 
         domain_hits = filter_hits_for_domain(hits, assessment.domain)
@@ -504,7 +578,7 @@ class TokkioNvidiaLLMRAGRouterService(TokkioNvidiaLLMService):
                 for hit, payload in zip(included_hits, citation_payloads)
             ]
             await self.push_frame(NvidiaRAGCitationsFrame(citations=citations))
-        direct_reply = grounded_direct_reply(query, included_hits)
+        direct_reply = grounded_direct_reply_for_turn(query, included_hits)
         if direct_reply:
             logger.info("Local RAG selected grounded direct reply for domain={}", assessment.domain)
             await self.start_ttfb_metrics()
@@ -555,7 +629,7 @@ class TokkioNvidiaLLMRAGRouterService(TokkioNvidiaLLMService):
         full_response = ""
         filler_said = False
         response_started = False
-        speech_buffer = SpeechSegmentBuffer()
+        speech_buffer = SpeechSegmentBuffer(first_clause_min_chars=FIRST_CLAUSE_MIN_CHARS)
         ttfb_stopped = False
 
         async def monitor_request_time():
@@ -635,15 +709,25 @@ class TokkioNvidiaLLMRAGRouterService(TokkioNvidiaLLMService):
 
         route = self._rag_route(chat_details)
         if route != "rag":
+            if looks_like_garbled_transcript(self._last_user_message(chat_details)):
+                logger.info("Transcript looks garbled; asking the visitor to repeat")
+                await self._push_fixed_reply(ASK_AGAIN_REPLY)
+                return
             logger.debug("RAG router selected direct LLM path")
-            if route == "outside_corpus":
+            query = self._resolved_rag_query(chat_details)
+            university_life = route == "direct" and needs_outside_corpus_note(query)
+            outside_corpus = route == "outside_corpus" or university_life
+            web_context = await self._web_search_context(
+                self._last_user_message(chat_details),
+                topic_outside_corpus=outside_corpus,
+                about_university=university_life,
+            )
+            if web_context:
+                context = self._build_local_rag_context(context, web_context, query)
+            elif outside_corpus or asks_about_campus(query):
                 # Tell the LLM the topic is not in the corpus so the persona prompt does not
                 # pull in Kagawa's own research or invent university facts.
-                context = self._build_local_rag_context(
-                    context,
-                    OUTSIDE_CORPUS_PROMPT_NOTE,
-                    self._resolved_rag_query(chat_details),
-                )
+                context = self._build_local_rag_context(context, OUTSIDE_CORPUS_PROMPT_NOTE, query)
             await super()._process_context(context)
             return
 

@@ -9,8 +9,14 @@ DEFAULT_GRAFANA_URL="http://10.209.1.12:32300"
 DEFAULT_IRODORI_TTS_PORT="8021"
 DEFAULT_IRODORI_TTS_HEALTH_URL="http://127.0.0.1:8021/healthz"
 DEFAULT_IRODORI_TTS_SERVICE="ace-irodori-tts.service"
+# The container unit of the sokutou TTS backend (infra/tts/ace-sokutou-tts.service), if installed.
+DEFAULT_IRODORI_TTS_ENGINE_SERVICE="ace-sokutou-tts.service"
 DEFAULT_QWEN_TTS_HEALTH_URL="http://127.0.0.1:8023/healthz"
 DEFAULT_QWEN_TTS_SERVICE="ace-indextts-tts.service"
+DEFAULT_SPEECHCPP_ASR_HEALTH_URL="http://127.0.0.1:8024/health"
+DEFAULT_SPEECHCPP_ASR_SERVICE="ace-speechcpp-asr.service"
+DEFAULT_SPEECHCPP_ASR_EN_HEALTH_URL="http://127.0.0.1:8025/health"
+DEFAULT_SPEECHCPP_ASR_EN_SERVICE="ace-speechcpp-asr-en.service"
 DEFAULT_RAG_HEALTH_URL="http://127.0.0.1:8081/v1/health?check_dependencies=true"
 
 usage() {
@@ -95,6 +101,7 @@ load_env() {
   # Same default as resolve_irodori_tts_settings in prepare_tokkio_workspace.py: the URL the controller uses.
   IRODORI_TTS_BASE_URL="${TOKKIO_IRODORI_TTS_BASE_URL:-http://${TOKKIO_APP_HOST_IPV4_ADDR:-127.0.0.1}:${DEFAULT_IRODORI_TTS_PORT}}"
   IRODORI_TTS_SERVICE="${TOKKIO_IRODORI_TTS_SERVICE:-${DEFAULT_IRODORI_TTS_SERVICE}}"
+  IRODORI_TTS_ENGINE_SERVICE="${TOKKIO_IRODORI_TTS_ENGINE_SERVICE-${DEFAULT_IRODORI_TTS_ENGINE_SERVICE}}"
   IRODORI_TTS_HEALTH_URL="${TOKKIO_IRODORI_TTS_HEALTH_URL:-${DEFAULT_IRODORI_TTS_HEALTH_URL}}"
   IRODORI_TTS_WAIT_ATTEMPTS="${TOKKIO_IRODORI_TTS_WAIT_ATTEMPTS:-60}"
   IRODORI_TTS_WAIT_SECONDS="${TOKKIO_IRODORI_TTS_WAIT_SECONDS:-2}"
@@ -110,6 +117,12 @@ load_env() {
   QWEN_TTS_HEALTH_URL="${TOKKIO_QWEN_TTS_HEALTH_URL:-${DEFAULT_QWEN_TTS_HEALTH_URL}}"
   QWEN_TTS_WAIT_ATTEMPTS="${TOKKIO_QWEN_TTS_WAIT_ATTEMPTS:-180}"
   QWEN_TTS_WAIT_SECONDS="${TOKKIO_QWEN_TTS_WAIT_SECONDS:-2}"
+  SPEECHCPP_ASR_SERVICE="${TOKKIO_SPEECHCPP_ASR_SERVICE:-${DEFAULT_SPEECHCPP_ASR_SERVICE}}"
+  SPEECHCPP_ASR_HEALTH_URL="${TOKKIO_SPEECHCPP_ASR_HEALTH_URL:-${DEFAULT_SPEECHCPP_ASR_HEALTH_URL}}"
+  SPEECHCPP_ASR_EN_SERVICE="${TOKKIO_SPEECHCPP_ASR_EN_SERVICE:-${DEFAULT_SPEECHCPP_ASR_EN_SERVICE}}"
+  SPEECHCPP_ASR_EN_HEALTH_URL="${TOKKIO_SPEECHCPP_ASR_EN_HEALTH_URL:-${DEFAULT_SPEECHCPP_ASR_EN_HEALTH_URL}}"
+  SPEECHCPP_ASR_WAIT_ATTEMPTS="${TOKKIO_SPEECHCPP_ASR_WAIT_ATTEMPTS:-60}"
+  SPEECHCPP_ASR_WAIT_SECONDS="${TOKKIO_SPEECHCPP_ASR_WAIT_SECONDS:-2}"
   RAG_ENABLED="${TOKKIO_RAG_ENABLED:-false}"
   RAG_MODE="${TOKKIO_RAG_MODE:-auto}"
   RAG_PROVIDER="${TOKKIO_RAG_PROVIDER:-local}"
@@ -191,6 +204,17 @@ stop_irodori_tts_service() {
 
   info "Stopping Irodori TTS service: ${IRODORI_TTS_SERVICE}"
   sudo systemctl stop "${IRODORI_TTS_SERVICE}" || true
+  # The sokutou container unit outlives a stop or crash of the service, so it stops here, before
+  # containerd stops, and its GPU memory is freed.
+  if irodori_tts_engine_unit_loaded; then
+    info "Stopping the TTS engine unit: ${IRODORI_TTS_ENGINE_SERVICE}"
+    sudo systemctl stop "${IRODORI_TTS_ENGINE_SERVICE}" || true
+  fi
+}
+
+irodori_tts_engine_unit_loaded() {
+  [[ -n "${IRODORI_TTS_ENGINE_SERVICE}" ]] \
+    && [[ "$(systemctl show -p LoadState --value "${IRODORI_TTS_ENGINE_SERVICE}" 2>/dev/null)" == loaded ]]
 }
 
 show_irodori_tts_status() {
@@ -201,10 +225,97 @@ show_irodori_tts_status() {
 
   info "systemctl is-active ${IRODORI_TTS_SERVICE}"
   systemctl is-active "${IRODORI_TTS_SERVICE}" || true
+  if irodori_tts_engine_unit_loaded; then
+    info "systemctl is-active ${IRODORI_TTS_ENGINE_SERVICE}"
+    systemctl is-active "${IRODORI_TTS_ENGINE_SERVICE}" || true
+  fi
   if check_irodori_tts_health; then
     info "Irodori TTS health: ok (${IRODORI_TTS_HEALTH_URL})"
   else
     warn "Irodori TTS health check failed: ${IRODORI_TTS_HEALTH_URL}"
+  fi
+}
+
+# The STT choice lives in the generated controller config (Pipeline.stt_processor),
+# not in .env, so the ASR unit follows whatever config.yaml the controller gets.
+uses_speechcpp_stt() {
+  grep -Eq '^[[:space:]]*stt_processor:[[:space:]]*"?SpeechCppSTTService"?[[:space:]]*$' \
+    "${TOKKIO_CONTROLLER_SOURCE_DIR}/configs/config.yaml" 2>/dev/null
+}
+
+# The Japanese recognizer (Haas) takes Japanese only, so the English mode's config
+# (SpeechCppSTTService.language "en") goes to Qwen3-ASR on its own unit and port.
+speechcpp_asr_language() {
+  awk '
+    /^SpeechCppSTTService:/ { inside = 1; next }
+    /^[^[:space:]#]/ { inside = 0 }
+    inside && /^[[:space:]]*language:/ { gsub(/["[:space:]]/, "", $2); print $2; exit }
+  ' FS=: "${TOKKIO_CONTROLLER_SOURCE_DIR}/configs/config.yaml" 2>/dev/null
+}
+
+# Sets ASR_SERVICE and ASR_HEALTH_URL to the unit config.yaml calls.
+select_speechcpp_asr_unit() {
+  if [[ "$(speechcpp_asr_language)" == "en" ]]; then
+    ASR_SERVICE="${SPEECHCPP_ASR_EN_SERVICE}"
+    ASR_HEALTH_URL="${SPEECHCPP_ASR_EN_HEALTH_URL}"
+  else
+    ASR_SERVICE="${SPEECHCPP_ASR_SERVICE}"
+    ASR_HEALTH_URL="${SPEECHCPP_ASR_HEALTH_URL}"
+  fi
+}
+
+check_speechcpp_asr_health() {
+  curl -fsS "${ASR_HEALTH_URL}" >/dev/null
+}
+
+start_speechcpp_asr_service() {
+  local attempt other
+
+  uses_speechcpp_stt || return 0
+  select_speechcpp_asr_unit
+  # The other language's unit holds GPU memory for nothing.
+  for other in "${SPEECHCPP_ASR_SERVICE}" "${SPEECHCPP_ASR_EN_SERVICE}"; do
+    [[ "${other}" == "${ASR_SERVICE}" ]] || stop_speechcpp_asr_unit "${other}"
+  done
+  info "Starting speech.cpp ASR service: ${ASR_SERVICE}"
+  # Callers run this under `||`, where errexit is off, so a failed start must return here.
+  if ! sudo systemctl start "${ASR_SERVICE}"; then
+    warn "Failed to start speech.cpp ASR service: ${ASR_SERVICE}"
+    return 1
+  fi
+  for attempt in $(seq 1 "${SPEECHCPP_ASR_WAIT_ATTEMPTS}"); do
+    if check_speechcpp_asr_health; then
+      info "speech.cpp ASR health check passed: ${ASR_HEALTH_URL}"
+      return 0
+    fi
+    info "Waiting for speech.cpp ASR health (${attempt}/${SPEECHCPP_ASR_WAIT_ATTEMPTS})"
+    sleep "${SPEECHCPP_ASR_WAIT_SECONDS}"
+  done
+  warn "Timed out waiting for speech.cpp ASR health: ${ASR_HEALTH_URL}"
+  return 1
+}
+
+stop_speechcpp_asr_unit() {
+  systemctl is-active --quiet "$1" || return 0
+  info "Stopping speech.cpp ASR service: $1"
+  sudo systemctl stop "$1" || true
+}
+
+# Both units, whenever they run, so a unit left from an earlier speech.cpp config does not keep its GPU memory.
+stop_speechcpp_asr_service() {
+  stop_speechcpp_asr_unit "${SPEECHCPP_ASR_SERVICE}"
+  stop_speechcpp_asr_unit "${SPEECHCPP_ASR_EN_SERVICE}"
+}
+
+show_speechcpp_asr_status() {
+  uses_speechcpp_stt || return 0
+  select_speechcpp_asr_unit
+  info "systemctl is-active ${ASR_SERVICE}"
+  systemctl is-active "${ASR_SERVICE}" || true
+  if check_speechcpp_asr_health; then
+    info "speech.cpp ASR health: ok (${ASR_HEALTH_URL})"
+  else
+    warn "speech.cpp ASR health check failed: ${ASR_HEALTH_URL}"
   fi
 }
 
@@ -639,6 +750,7 @@ show_status() {
   show_irodori_tts_status
   show_qwen_tts_status
   warn_on_idle_english_tts
+  show_speechcpp_asr_status
   show_rag_status
   run_kubectl_get_pods || true
   show_controller_status_line
@@ -660,6 +772,9 @@ ensure_controller_runtime_source_files() {
     "${source_dir}/src/tokkio_llm.py"
     "${source_dir}/src/tokkio_irodori_tts.py"
     "${source_dir}/src/tokkio_rag.py"
+    "${source_dir}/src/tokkio_speechcpp_stt.py"
+    "${source_dir}/src/tokkio_web_search.py"
+    "${source_dir}/src/tokkio_turn.py"
     "${source_dir}/configs/config.yaml"
   )
 
@@ -732,6 +847,8 @@ sync_controller_runtime_files() {
   local publish_prepare_commands
   local publish_commit_commands
   local config_file="${source_dir}/configs/config.yaml"
+  # Web search key written by prepare_tokkio_workspace.py; absent means web search is off.
+  local web_search_key_file="${TOKKIO_CONTROLLER_DIR}/generated/exa_api_key"
   local src_files=(
     "bot.py"
     "config.py"
@@ -739,6 +856,9 @@ sync_controller_runtime_files() {
     "tokkio_llm.py"
     "tokkio_irodori_tts.py"
     "tokkio_rag.py"
+    "tokkio_speechcpp_stt.py"
+    "tokkio_web_search.py"
+    "tokkio_turn.py"
   )
 
   ensure_controller_runtime_source_files
@@ -763,6 +883,9 @@ sync_controller_runtime_files() {
     kubectl cp "${source_dir}/src/${src_file}" "${APP_NAMESPACE}/${pod_name}:${staging_dir}/src/${src_file}"
   done
   kubectl cp "${config_file}" "${APP_NAMESPACE}/${pod_name}:${staging_dir}/configs/config.yaml"
+  if [[ -f "${web_search_key_file}" ]]; then
+    kubectl cp "${web_search_key_file}" "${APP_NAMESPACE}/${pod_name}:${staging_dir}/configs/exa_api_key"
+  fi
   if is_rag_enabled && [[ "${RAG_PROVIDER,,}" == "local" ]]; then
     kubectl cp "${local_rag_db_file}" \
       "${APP_NAMESPACE}/${pod_name}:${staging_dir}/configs/${local_rag_db_name}"
@@ -808,6 +931,12 @@ sync_controller_runtime_files() {
   done
   publish_prepare_commands+=" cp '${staging_dir}/configs/config.yaml' '/code/configs/.config.yaml.${sync_id}.tmp';"
   publish_commit_commands+=" mv -f '/code/configs/.config.yaml.${sync_id}.tmp' '/code/configs/config.yaml';"
+  if [[ -f "${web_search_key_file}" ]]; then
+    publish_prepare_commands+=" install -m 600 '${staging_dir}/configs/exa_api_key' '/code/configs/.exa_api_key.${sync_id}.tmp';"
+    publish_commit_commands+=" mv -f '/code/configs/.exa_api_key.${sync_id}.tmp' '/code/configs/exa_api_key';"
+  else
+    publish_commit_commands+=" rm -f '/code/configs/exa_api_key';"
+  fi
   if is_rag_enabled && [[ "${RAG_PROVIDER,,}" == "local" ]]; then
     publish_prepare_commands+=" cp '${staging_dir}/configs/${local_rag_db_name}' '/code/configs/.${local_rag_db_name}.${sync_id}.tmp';"
     publish_prepare_commands+=" cp '${staging_dir}/configs/${local_rag_manifest_name}' '/code/configs/.${local_rag_manifest_name}.${sync_id}.tmp';"
@@ -944,6 +1073,7 @@ case "${COMMAND}" in
     # A TTS or RAG failure must not leave the app workloads at zero replicas; report it at the end.
     start_irodori_tts_service || start_rc=1
     start_qwen_tts_service || start_rc=1
+    start_speechcpp_asr_service || start_rc=1
     wait_for_rag_health || start_rc=1
     restore_app_workloads || true
     sync_controller_runtime_files
@@ -961,6 +1091,7 @@ case "${COMMAND}" in
     quiesce_app_workloads || stop_rc=1
     stop_irodori_tts_service
     stop_qwen_tts_service
+    stop_speechcpp_asr_service
     stop_services
     show_service_status
     show_irodori_tts_status
@@ -980,6 +1111,7 @@ case "${COMMAND}" in
     quiesce_app_workloads
     stop_irodori_tts_service
     stop_qwen_tts_service
+    stop_speechcpp_asr_service
     stop_services
     info "Waiting 3 seconds before restart"
     sleep 3
@@ -987,6 +1119,7 @@ case "${COMMAND}" in
     start_rc=0
     start_irodori_tts_service || start_rc=1
     start_qwen_tts_service || start_rc=1
+    start_speechcpp_asr_service || start_rc=1
     wait_for_rag_health || start_rc=1
     restore_app_workloads || true
     sync_controller_runtime_files

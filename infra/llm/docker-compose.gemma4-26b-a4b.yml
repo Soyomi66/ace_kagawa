@@ -1,0 +1,46 @@
+# Gemma 4 26B A4B (MoE, 4B active) on vLLM, the production LLM since 2026-11-13 in the former Swallow-8B slot
+# (GPU0, 0.55 x 48 GB, --max-model-len 16384). Evaluated in docs/audits/llm-gemma4-26b-a4b-2026-11-13.md.
+# The weights are the 4-bit AWQ build (compressed-tensors, 17.2 GB on disk): bf16 is 52 GB, FP8 is 28.7 GB.
+# NVFP4 builds do not run on the RTX 6000 Ada. Needs vLLM v0.32.0-cu129; torchcodec is removed in the local
+# image (Dockerfile.vllm-cu129), as for the 12B.
+# Serves on 8011, the port Tokkio's TOKKIO_LLM_BASE_URL uses; stop the Swallow or 12B container first
+# (same procedure as the 12B, infra/tokkio/README.md). For side-by-side tests set VLLM_PORT=8019.
+# The served name must contain "gemma-4": infra/tokkio/tokkio_llm.py matches it to send the evaluated
+# sampling with thinking off (Gemma 4's chat template is non-thinking unless enable_thinking is true).
+# Own project name: see docker-compose.gemma4-12b.yml (a shared project would list the other LLM as an orphan).
+name: ace-llm-gemma4-26b
+services:
+  vllm-gemma4-26b-a4b:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm-cu129
+    image: ${VLLM_IMAGE:-ace/vllm-openai:v0.32.0-cu129-no-torchcodec}
+    container_name: ${VLLM_CONTAINER_NAME:-ace-vllm-gemma4-26b-a4b}
+    restart: unless-stopped
+    runtime: nvidia
+    shm_size: "16gb"
+    ipc: host
+    network_mode: host
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${VLLM_GPU_DEVICES:-0}
+      OMP_NUM_THREADS: "8"
+      HF_HOME: /data/ACE/hf-cache
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - /data/ACE/hf-cache:/data/ACE/hf-cache
+    command:
+      - --model
+      - ${VLLM_MODEL:-cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit}
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${VLLM_PORT:-8011}
+      - --served-model-name
+      - ${VLLM_SERVED_MODEL_NAME:-gemma-4-26b-a4b-it}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEM_UTIL:-0.55}
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-16384}
+      # Text only: no memory reserved for the image/video/audio encoders.
+      - --limit-mm-per-prompt
+      - '{"image":0,"video":0,"audio":0}'

@@ -1,0 +1,34 @@
+[Unit]
+Description=ACE sokutou voice server (Irodori v4.1-Small on CUDA graphs) for the Irodori TTS service
+# ace-irodori-tts.service (IRODORI_TTS_BACKEND=sokutou) is its only client. install_irodori_tts_service.sh
+# enables this unit for that backend, so starting the service starts it, and disables it for the others.
+# A stop or a crash of the service leaves this unit running and warm: a service that waits for a cold
+# engine and fails would otherwise restart it again and again. manage_tokkio.sh stop stops both units,
+# which frees about 13 GB on GPU 0; by hand: sudo systemctl stop ace-irodori-tts.service ace-sokutou-tts.service
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=kyano
+Group=kyano
+# Built from github.com/kosuketut/sokutou commit 68b871c with the command in infra/tts/README.md.
+Environment=SOKUTOU_TTS_IMAGE=ace-kagawa/sokutou-server:68b871c
+Environment=SOKUTOU_TTS_CONTAINER=ace-sokutou-tts
+# nvidia-smi GPU 0, with vLLM, Riva and A2F; GPU 1 runs another project's production voice server.
+Environment=SOKUTOU_TTS_GPU_UUID=GPU-d4c17c05-f87d-de54-7fdc-adf8c1dc6f16
+# Host-only: irodori_server.py calls http://127.0.0.1:8026 (IRODORI_TTS_SOKUTOU_URL).
+Environment=SOKUTOU_TTS_PORT=8026
+# Must equal IRODORI_TTS_NUM_STEPS; the client refuses an engine that runs other steps.
+Environment=SOKUTOU_TTS_NUM_STEPS=12
+Environment=SOKUTOU_TTS_VOICE=kagawa
+Environment=SOKUTOU_TTS_REFERENCE_WAV=/data/ACE/irodori/reference/kagawa_voice_ref_48k_mono.wav
+Environment=SOKUTOU_TTS_HF_HOME=/data/ACE/irodori/hf-cache
+ExecStart=/home/kyano/workspace/ACE/ace_kagawa/infra/tts/run_sokutou_tts.sh
+ExecStop=/usr/bin/docker stop -t 20 ${SOKUTOU_TTS_CONTAINER}
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=ace-irodori-tts.service

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 import sys
 import types
 import unittest
@@ -56,6 +57,7 @@ class FakeResampler:
 class FakeTTSService:
     def __init__(self, *, sample_rate: int, push_text_frames: bool, push_stop_frames: bool, **kwargs) -> None:
         self._sample_rate = sample_rate
+        self.text_aggregator = kwargs.get("text_aggregator")
         self.push_text_frames = push_text_frames
         self.push_stop_frames = push_stop_frames
         self.voice = None
@@ -73,6 +75,30 @@ class FakeTTSService:
 
     async def start_tts_usage_metrics(self, text: str) -> None:
         self.usage_texts.append(text)
+
+
+class FakeSimpleTextAggregator:
+    """pipecat's SimpleTextAggregator: hold text until it ends a sentence."""
+
+    def __init__(self) -> None:
+        self._text = ""
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    async def aggregate(self, text: str) -> str | None:
+        self._text += text
+        if not re.search(r"[。？！；.?!;]$", self._text):
+            return None
+        result, self._text = self._text, ""
+        return result
+
+    async def handle_interruption(self) -> None:
+        self._text = ""
+
+    async def reset(self) -> None:
+        self._text = ""
 
 
 def load_tokkio_irodori_tts():
@@ -103,6 +129,9 @@ def load_tokkio_irodori_tts():
     tts_service_module = types.ModuleType("pipecat.services.tts_service")
     tts_service_module.TTSService = FakeTTSService
 
+    text_aggregator_module = types.ModuleType("pipecat.utils.text.simple_text_aggregator")
+    text_aggregator_module.SimpleTextAggregator = FakeSimpleTextAggregator
+
     previous = {
         name: sys.modules.get(name)
         for name in (
@@ -113,6 +142,9 @@ def load_tokkio_irodori_tts():
             "pipecat.frames.frames",
             "pipecat.services",
             "pipecat.services.tts_service",
+            "pipecat.utils",
+            "pipecat.utils.text",
+            "pipecat.utils.text.simple_text_aggregator",
             "httpx",
             "loguru",
         )
@@ -126,6 +158,9 @@ def load_tokkio_irodori_tts():
     sys.modules["pipecat.frames.frames"] = frames_module
     sys.modules["pipecat.services"] = types.ModuleType("pipecat.services")
     sys.modules["pipecat.services.tts_service"] = tts_service_module
+    sys.modules["pipecat.utils"] = types.ModuleType("pipecat.utils")
+    sys.modules["pipecat.utils.text"] = types.ModuleType("pipecat.utils.text")
+    sys.modules["pipecat.utils.text.simple_text_aggregator"] = text_aggregator_module
 
     spec = importlib.util.spec_from_file_location(
         "tokkio_irodori_tts_under_test",
@@ -460,6 +495,47 @@ class TokkioIrodoriTtsTests(unittest.IsolatedAsyncioTestCase):
             await frames.aclose()
         finally:
             restore_modules(previous)
+
+
+class FirstClauseTextAggregatorTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.module, self.previous = load_tokkio_irodori_tts()
+        self.aggregator = self.module.FirstClauseTextAggregator()
+
+    async def asyncTearDown(self) -> None:
+        restore_modules(self.previous)
+
+    async def feed(self, *texts: str) -> list[str | None]:
+        return [await self.aggregator.aggregate(text) for text in texts]
+
+    async def test_first_clause_goes_to_tts_and_later_clauses_wait_for_the_sentence(self) -> None:
+        self.assertEqual(
+            await self.feed("東京工科大学へは、", "八王子駅から、", "バスです。"),
+            ["東京工科大学へは、", None, "八王子駅から、バスです。"],
+        )
+
+    async def test_each_reply_gets_its_own_first_clause(self) -> None:
+        await self.feed("東京工科大学へは、", "八王子駅から、")
+        await self.aggregator.reset()  # pipecat: end of the reply
+        self.assertEqual(await self.feed("学費は、"), ["学費は、"])
+
+    async def test_interruption_starts_a_new_reply(self) -> None:
+        await self.feed("東京工科大学へは、", "八王子駅から、")
+        await self.aggregator.handle_interruption()
+        self.assertEqual(await self.feed("はい、"), ["はい、"])
+
+    async def test_reply_that_opens_with_a_sentence_is_aggregated_as_before(self) -> None:
+        self.assertEqual(
+            await self.feed("八王子にあります。", "駅からは、", "バスです。"),
+            ["八王子にあります。", None, "駅からは、バスです。"],
+        )
+
+    async def test_service_uses_the_aggregator_only_when_asked(self) -> None:
+        on = self.module.IrodoriTTSService(base_url="http://tts.local", start_on_first_clause=True)
+        off = self.module.IrodoriTTSService(base_url="http://tts.local")
+
+        self.assertIsInstance(on.text_aggregator, self.module.FirstClauseTextAggregator)
+        self.assertIsNone(off.text_aggregator)
 
 
 if __name__ == "__main__":

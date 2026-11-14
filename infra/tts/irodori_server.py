@@ -21,6 +21,8 @@ import subprocess
 from threading import Lock, Thread
 import time
 from typing import Iterator, Mapping
+import urllib.error
+import urllib.request
 import wave
 
 import numpy as np
@@ -35,10 +37,14 @@ DEFAULT_FIXED_OPEN_CAMPUS_GREETING_PCM = (
     DEFAULT_DATA_ROOT / "fixed-phrases" / "open_campus_greeting_16k_mono.pcm"
 )
 DEFAULT_VOICE = "kagawa"
-BACKENDS = ("python", "speechcpp")
+BACKENDS = ("python", "speechcpp", "sokutou")
 DEFAULT_SPEECHCPP_BIN = Path("/data/ACE/speech-cpp/runtime/v0.8.7/speech")
 DEFAULT_SPEECHCPP_MODEL = Path("/data/ACE/speech-cpp/models/Irodori-TTS-859M-v4.1-F16.gguf")
 DEFAULT_SPEECHCPP_VOICE = DEFAULT_DATA_ROOT / "speech-cpp" / "kagawa_voice_ref_48k_mono.voice.gguf"
+# ace-sokutou-tts.service publishes the container on this host-only port.
+DEFAULT_SOKUTOU_URL = "http://127.0.0.1:8026"
+# sokutou's SpeechIn.speed bounds; speed is the inverse of duration_scale.
+SOKUTOU_SPEED_RANGE = (0.5, 2.0)
 # Irodori's SamplingRequest.max_seconds default.
 MAX_SYNTHESIS_SECONDS = 30.0
 MIN_CAPPED_SECONDS = 1.2
@@ -48,6 +54,10 @@ PRONUNCIATION_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"香川\s*豊(?![子島江美])"), "香川ゆたか"),
     (re.compile(r"(?<![A-Za-z])USJ(?![A-Za-z])", re.IGNORECASE), "ユーエスジェイ"),
     (re.compile(r"(?<![A-Za-z])Q&A(?![A-Za-z])", re.IGNORECASE), "キューアンドエー"),
+    # Materials terms from Kagawa's research profile; the reader otherwise spells them freely.
+    (re.compile(r"(?<![A-Za-z])SiC\s*/\s*SiC(?![A-Za-z])", re.IGNORECASE), "エスアイシーエスアイシー"),
+    (re.compile(r"(?<![A-Za-z])SiC(?![A-Za-z])", re.IGNORECASE), "エスアイシー"),
+    (re.compile(r"(?<![A-Za-z])CMC(?![A-Za-z])"), "シーエムシー"),
     (
         re.compile(
             r"青嵐\s*[（(]\s*(?:読み\s*[：:]\s*)?(?:せいらん|セイラン|SEIRAN)"
@@ -152,7 +162,8 @@ _HOUR_MINUTE_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})時(\d{1,2})分(?![野�
 _RATIO_RE = re.compile(rf"(?<![A-Za-z0-9:.])(\d+):(\d)(?![\d:]|{_LABEL_UNIT})")
 _WEEKDAY_AFTER_DAY_RE = re.compile(r"、(?:[月火水木金土日]曜日|祝日)")
 _CALENDAR_DAY_PREFIXES = ("月", "今月の", "来月の", "先月の", "毎月の")
-_ACADEMIC_YEAR_RE = re.compile(r"(?<![A-Za-z0-9])(\d{4})年度")
+_ACADEMIC_YEAR_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,4})年度")
+_DECADE_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,4})年代")
 _YEAR_ORDINAL_RE = re.compile(r"(?<![A-Za-z0-9])(\d+)年目")
 _YEAR_DURATION_RE = re.compile(r"(?<![A-Za-z0-9])(\d+)年間")
 _YEAR_RE = re.compile(r"(?<![A-Za-z0-9,.])(\d{1,4})年")
@@ -187,7 +198,8 @@ _LARGE_KANJI_UNIT_RE = re.compile(
 )
 # 回答/回収 are words (100回答, 1回収), but 1回答えて and 1回収集 are counts.
 _COUNTERS = (
-    r"丁目|科目|教科|時間|週間|周年|試合|種類|世紀|[かヶケカヵ箇](?:月|所|国)|歳|才|位|基|期|級|台|枚|個|"
+    r"丁目|科目|教科|時間|週間|周年|試合|種類|世紀|[かヶケカヵ箇](?:月|所|国)|歳代|才代|歳|才|位|基|期|級|台|枚|個|"
+    r"代(?![表金わ理替行議々謝用案数償弁筆役名打])|"
     r"本(?![体部日当格来質学])|冊|組(?![織合])|倍|匹|名|人|件|校|回(?!答(?!え)|収(?![集録]))|階(?![層段])|"
     r"点(?!検)|泊|杯|週|軒|頭|足(?![しさすせそ])|着(?!用)|曲(?!線)|社(?![会員長])|種(?![目別])|室(?!長)|"
     r"席|章|周(?![辺囲年])|缶|巻|歩(?![道行])|発(?![表見言売生展信達行明電音想])|箱|通り|"
@@ -222,6 +234,8 @@ _STANDALONE_NUMBER_RE = re.compile(
     r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]\.)(\d[\d,]*)(?![A-Za-z0-9]|\.\d)"
 )
 _DIGIT_READINGS = ("ぜろ", "いち", "に", "さん", "よん", "ご", "ろく", "なな", "はち", "きゅう")
+_KANJI_DIGITS = "〇一二三四五六七八九"
+_YEAR_SUFFIX_READINGS = {"年": "ねん", "年度": "ねんど", "年代": "ねんだい"}
 _LARGE_NUMBER_UNITS = ("", "まん", "おく", "ちょう", "けい")
 _LARGE_UNIT_READINGS = {"万": "まん", "億": "おく"}
 _TECH_UNIT_READINGS = {
@@ -285,6 +299,8 @@ _SOKUON_COUNTERS: dict[str, tuple[str, frozenset[int]]] = {
     "缶": ("かん", _K_ROW_SOKUON_DIGITS),
     "巻": ("かん", _K_ROW_SOKUON_DIGITS),
     "歳": ("さい", _S_ROW_SOKUON_DIGITS),
+    "歳代": ("さいだい", _S_ROW_SOKUON_DIGITS),
+    "才代": ("さいだい", _S_ROW_SOKUON_DIGITS),
     "才": ("さい", _S_ROW_SOKUON_DIGITS),
     "冊": ("さつ", _S_ROW_SOKUON_DIGITS),
     "週": ("しゅう", _S_ROW_SOKUON_DIGITS),
@@ -315,6 +331,7 @@ _H_ROW_COUNTERS = {
 }
 _PLAIN_COUNTER_SUFFIXES = {
     "位": "い",
+    "代": "だい",
     "台": "だい",
     "枚": "まい",
     "倍": "ばい",
@@ -435,6 +452,30 @@ def _read_japanese_integer(raw_value: str, *, before_large_unit: bool = False) -
 def _read_year_value(raw_value: str) -> str:
     reading = _read_japanese_integer(raw_value)
     return reading[:-2] + "よ" if reading.endswith("よん") else reading
+
+
+def _kanji_numeral(value: int) -> str:
+    """Write 1-9999 in kanji numerals: 1952 -> 千九百五十二, 2010 -> 二千十."""
+    parts: list[str] = []
+    for place, unit in ((1000, "千"), (100, "百"), (10, "十")):
+        digit, value = divmod(value, place)
+        if digit:
+            parts.append(("" if digit == 1 else _KANJI_DIGITS[digit]) + unit)
+    if value:
+        parts.append(_KANJI_DIGITS[value])
+    return "".join(parts)
+
+
+def _read_year(raw_value: str, suffix: str = "年") -> str:
+    """Read N年, N年度 or N年代; a four-digit year is spelled in kanji numerals.
+
+    The model slurred a kana せんきゅうひゃく… year in 8 of 148 takes (transcribed
+    千九百百五十二年, 一九五二年) and a kanji year in none of 105 (2026-10-17).
+    """
+    digits = raw_value.replace(",", "")
+    if len(digits) == 4 and not digits.startswith("0"):
+        return f"{_kanji_numeral(int(digits))}{suffix}"
+    return f"{_read_year_value(raw_value)}{_YEAR_SUFFIX_READINGS[suffix]}"
 
 
 def _read_digits(raw_value: str) -> str:
@@ -649,7 +690,7 @@ def _read_slash_date(raw_year: str | None, raw_month: str, raw_day: str) -> str 
     month, day = int(raw_month), int(raw_day)
     if not (1 <= month <= 12 and 1 <= day <= 31):
         return None
-    year = "" if raw_year is None else f"{_read_year_value(raw_year)}ねん"
+    year = "" if raw_year is None else _read_year(raw_year)
     return f"{year}{_read_month_day(raw_month, raw_day)}"
 
 
@@ -778,10 +819,7 @@ def _normalize_japanese_numbers(text: str) -> str:
     normalized = _MINUS_SIGN_RE.sub("マイナス", normalized)
     normalized = _PLUS_SIGN_RE.sub("プラス", normalized)
     normalized = _FULL_DATE_RE.sub(
-        lambda match: (
-            f"{_read_year_value(match.group(1))}ねん"
-            f"{_read_month_day(match.group(2), match.group(3))}"
-        ),
+        lambda match: f"{_read_year(match.group(1))}{_read_month_day(match.group(2), match.group(3))}",
         normalized,
     )
     normalized = _MONTH_DAY_RE.sub(
@@ -795,10 +833,8 @@ def _normalize_japanese_numbers(text: str) -> str:
         ),
         normalized,
     )
-    normalized = _ACADEMIC_YEAR_RE.sub(
-        lambda match: f"{_read_year_value(match.group(1))}ねんど",
-        normalized,
-    )
+    normalized = _ACADEMIC_YEAR_RE.sub(lambda match: _read_year(match.group(1), "年度"), normalized)
+    normalized = _DECADE_RE.sub(lambda match: _read_year(match.group(1), "年代"), normalized)
     normalized = _YEAR_ORDINAL_RE.sub(
         lambda match: f"{_read_year_value(match.group(1))}ねんめ",
         normalized,
@@ -807,10 +843,7 @@ def _normalize_japanese_numbers(text: str) -> str:
         lambda match: f"{_read_year_value(match.group(1))}ねんかん",
         normalized,
     )
-    normalized = _YEAR_RE.sub(
-        lambda match: f"{_read_year_value(match.group(1))}ねん",
-        normalized,
-    )
+    normalized = _YEAR_RE.sub(lambda match: _read_year(match.group(1)), normalized)
     normalized = _MONTH_RE.sub(lambda match: _read_month_value(match.group(1)), normalized)
     normalized = _DAY_RE.sub(
         lambda match: _read_day_value(match.group(1), calendar=_is_calendar_day(match)),
@@ -905,6 +938,9 @@ def normalize_speech_input(text: str) -> str:
 
 
 _SMALL_KANA = frozenset("ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ")
+# Sentences that take IRODORI_TTS_SYMPATHY_EMOJI: a cheerful 😊 before
+# オープンキャンパスは既に終了しています。 sounds glad about it.
+_SYMPATHY_RE = re.compile(r"残念|申し訳|すみません|ごめん|お気の毒|終了|中止|できません|[分わ]かりません")
 _PAUSE_CHARS = frozenset("、，,。．！？!?")
 # Upstream Irodori NFKC-folds its input, so the model speaks these like their normal forms.
 _WIDTH_VARIANT_RE = re.compile(r"[０-９Ａ-Ｚａ-ｚ\uff61-\uff9f]+")
@@ -1062,6 +1098,27 @@ def _env_texts(env: Mapping[str, str], key: str) -> tuple[str, ...]:
     return tuple(text.strip() for text in raw.split("|") if text.strip())
 
 
+def _check_sokutou_env(env: Mapping[str, str], *, caption: str) -> None:
+    """Refuse settings the sokutou container would silently ignore or answer 422."""
+    if caption:
+        raise ValueError("the sokutou backend reads no caption; unset IRODORI_TTS_CAPTION")
+    num_steps = _env_optional_int(env, "IRODORI_TTS_NUM_STEPS")
+    if num_steps is None:
+        # The container takes its steps from IRODORI_NUM_STEPS at start; the client checks them.
+        raise ValueError("the sokutou backend needs IRODORI_TTS_NUM_STEPS, the steps its container runs")
+    prewarm_steps = _env_optional_int(env, "IRODORI_TTS_SHORT_CACHE_PREWARM_NUM_STEPS")
+    if prewarm_steps is not None and prewarm_steps != num_steps:
+        raise ValueError(
+            "the sokutou backend runs one step count; IRODORI_TTS_SHORT_CACHE_PREWARM_NUM_STEPS must be unset "
+            f"or {num_steps}"
+        )
+    low, high = SOKUTOU_SPEED_RANGE
+    for key in ("IRODORI_TTS_DURATION_SCALE", "IRODORI_TTS_SHORT_DURATION_SCALE"):
+        scale = _env_float(env, key, 1.0)
+        if not low <= scale <= high:
+            raise ValueError(f"the sokutou backend takes {key} from {low:g} to {high:g} (speed 1/{key})")
+
+
 @dataclass(frozen=True)
 class IrodoriSettings:
     host: str = "0.0.0.0"
@@ -1075,6 +1132,13 @@ class IrodoriSettings:
     fixed_open_campus_greeting_pcm: Path = DEFAULT_FIXED_OPEN_CAMPUS_GREETING_PCM
     voice: str = DEFAULT_VOICE
     caption: str | None = None
+    # How strongly the caption steers the delivery (speech.cpp cfg_scale_instructions, PyTorch
+    # cfg_scale_caption); None keeps the runtime's 3.
+    caption_cfg_scale: float | None = None
+    # Irodori reads some emoji as directions (😊 cheerful, 🫶 tender). style_emoji goes before
+    # every sentence and sympathy_emoji, when set, before bad news and apologies instead.
+    style_emoji: str | None = None
+    sympathy_emoji: str | None = None
     model_device: str = "cuda:0"
     model_precision: str = "bf16"
     codec_device: str = "cuda:0"
@@ -1127,6 +1191,15 @@ class IrodoriSettings:
     speechcpp_gpu_uuid: str | None = None
     speechcpp_threads: int = 8
     speechcpp_timeout_seconds: float = 120.0
+    # "sokutou" sends the synthesis to sokutou's voice server (github.com/kosuketut/sokutou), a
+    # container that ace-sokutou-tts.service runs: the same Irodori model with CUDA graphs and a BF16
+    # DiT. Like speechcpp it keeps the HTTP contract, normalization, caches and output stage here. It
+    # reads no caption, fixes its sampler steps when it starts, has no LoRA and no watermark.
+    sokutou_url: str = DEFAULT_SOKUTOU_URL
+    # How long the first request waits for the container's /health; manage_tokkio.sh gives the
+    # whole service 120 s to answer /healthz.
+    sokutou_startup_timeout_seconds: float = 100.0
+    sokutou_timeout_seconds: float = 60.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "IrodoriSettings":
@@ -1134,14 +1207,25 @@ class IrodoriSettings:
         checkpoint_raw = values.get("IRODORI_TTS_CHECKPOINT", "").strip()
         lora_raw = values.get("IRODORI_TTS_LORA_ADAPTER", "").strip()
         caption_raw = values.get("IRODORI_TTS_CAPTION", "").strip()
+        caption_cfg_scale = _env_optional_float(values, "IRODORI_TTS_CAPTION_CFG_SCALE")
+        if caption_cfg_scale is not None and not caption_raw:
+            # speech.cpp refuses an option that another leaves without effect.
+            raise ValueError("IRODORI_TTS_CAPTION_CFG_SCALE needs IRODORI_TTS_CAPTION")
+        emoji = {}
+        for key in ("IRODORI_TTS_STYLE_EMOJI", "IRODORI_TTS_SYMPATHY_EMOJI"):
+            emoji[key] = values.get(key, "").strip() or None
+            if emoji[key] is not None and has_speakable_text(emoji[key]):
+                raise ValueError(f"{key} must be emoji the model reads as a direction, not text to speak")
         stream_chunk_bytes = _env_int(values, "IRODORI_TTS_STREAM_CHUNK_BYTES", 3200)
         if stream_chunk_bytes <= 0:
             raise ValueError("IRODORI_TTS_STREAM_CHUNK_BYTES must be positive")
         backend = values.get("IRODORI_TTS_BACKEND", "python").strip() or "python"
         if backend not in BACKENDS:
             raise ValueError(f"IRODORI_TTS_BACKEND must be one of: {', '.join(BACKENDS)}")
-        if backend == "speechcpp" and lora_raw:
-            raise ValueError("the speechcpp backend has no LoRA support; unset IRODORI_TTS_LORA_ADAPTER")
+        if backend in ("speechcpp", "sokutou") and lora_raw:
+            raise ValueError(f"the {backend} backend has no LoRA support; unset IRODORI_TTS_LORA_ADAPTER")
+        if backend == "sokutou":
+            _check_sokutou_env(values, caption=caption_raw)
         gpu_uuid_raw = values.get("IRODORI_TTS_SPEECHCPP_GPU_UUID", "").strip()
         return cls(
             host=values.get("IRODORI_TTS_HOST", "0.0.0.0").strip() or "0.0.0.0",
@@ -1160,6 +1244,9 @@ class IrodoriSettings:
             ),
             voice=values.get("IRODORI_TTS_VOICE", DEFAULT_VOICE).strip() or DEFAULT_VOICE,
             caption=caption_raw or None,
+            caption_cfg_scale=caption_cfg_scale,
+            style_emoji=emoji["IRODORI_TTS_STYLE_EMOJI"],
+            sympathy_emoji=emoji["IRODORI_TTS_SYMPATHY_EMOJI"],
             model_device=values.get("IRODORI_TTS_MODEL_DEVICE", "cuda:0").strip() or "cuda:0",
             model_precision=values.get("IRODORI_TTS_MODEL_PRECISION", "bf16").strip() or "bf16",
             codec_device=values.get("IRODORI_TTS_CODEC_DEVICE", "cuda:0").strip() or "cuda:0",
@@ -1215,6 +1302,9 @@ class IrodoriSettings:
             speechcpp_gpu_uuid=gpu_uuid_raw or None,
             speechcpp_threads=_env_int(values, "IRODORI_TTS_SPEECHCPP_THREADS", 8),
             speechcpp_timeout_seconds=_env_float(values, "IRODORI_TTS_SPEECHCPP_TIMEOUT_SECONDS", 120.0),
+            sokutou_url=(values.get("IRODORI_TTS_SOKUTOU_URL", "").strip() or DEFAULT_SOKUTOU_URL).rstrip("/"),
+            sokutou_startup_timeout_seconds=_env_float(values, "IRODORI_TTS_SOKUTOU_STARTUP_TIMEOUT_SECONDS", 100.0),
+            sokutou_timeout_seconds=_env_float(values, "IRODORI_TTS_SOKUTOU_TIMEOUT_SECONDS", 60.0),
         )
 
     def ensure_reference_wav(self) -> Path:
@@ -1592,6 +1682,119 @@ class SpeechCppWorker:
             pass
 
 
+class SokutouClient:
+    """sokutou's voice server (POST /v1/audio/speech, GET /health and /v1/engine) over HTTP.
+
+    The container belongs to ace-sokutou-tts.service, so this class never starts or stops it: start
+    waits until the engine has warmed up and checks that it runs the configured steps.
+    """
+
+    def __init__(self, settings: IrodoriSettings, *, clock=time.monotonic, sleep=time.sleep) -> None:
+        self._settings = settings
+        self._clock = clock
+        self._sleep = sleep
+        self.engine: dict | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.engine is not None
+
+    def start(self) -> None:
+        settings = self._settings
+        deadline = self._clock() + settings.sokutou_startup_timeout_seconds
+        last_error = "no answer"
+        while True:
+            try:
+                status, _body = self._get("/health", timeout=2.0)
+                if status == 200:
+                    break
+                last_error = f"/health answered {status} (still warming up)"
+            except OSError as exc:
+                last_error = str(exc)
+            if self._clock() >= deadline:
+                raise RuntimeError(
+                    f"sokutou at {settings.sokutou_url} was not ready in "
+                    f"{settings.sokutou_startup_timeout_seconds:g} s ({last_error}); "
+                    "check `systemctl status ace-sokutou-tts.service`"
+                )
+            self._sleep(0.5)
+        status, body = self._get("/v1/engine", timeout=5.0)
+        engine = json.loads(body) if status == 200 else {}
+        if engine.get("num_steps") != settings.num_steps:
+            raise RuntimeError(
+                f"sokutou at {settings.sokutou_url} runs {engine.get('num_steps')} steps, but "
+                f"IRODORI_TTS_NUM_STEPS={settings.num_steps}; set the same steps in ace-sokutou-tts.service"
+            )
+        self.engine = engine
+        _logger().info("sokutou at %s ready: %s steps", settings.sokutou_url, engine.get("num_steps"))
+
+    def close(self) -> None:
+        self.engine = None
+
+    def synthesize(self, body: dict[str, object]) -> tuple[np.ndarray, int]:
+        """Mono float32 audio and its rate for one /v1/audio/speech request body."""
+        if not self.running:
+            self.start()
+        try:
+            return self._post_speech(body)
+        except _ImplausibleDuration:
+            # sokutou refuses audio far longer than its text (babble) so that the caller can try
+            # again; without a seed the second try samples anew.
+            pass
+        try:
+            return self._post_speech(body)
+        except _ImplausibleDuration as exc:
+            raise RuntimeError(f"sokutou: {exc} (twice)") from None
+
+    def _post_speech(self, body: dict[str, object]) -> tuple[np.ndarray, int]:
+        url = self._settings.sokutou_url + "/v1/audio/speech"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._settings.sokutou_timeout_seconds) as response:
+                data = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
+            if exc.code == 500 and detail.startswith("implausible duration"):
+                raise _ImplausibleDuration(detail) from None
+            if 400 <= exc.code < 500:
+                raise ValueError(f"sokutou refused the text: {detail}") from None
+            if exc.code == 503:
+                # A restarted container warms up again before it answers.
+                self.engine = None
+            raise RuntimeError(f"sokutou answered {exc.code}: {detail}") from None
+        except OSError as exc:
+            self.engine = None
+            raise RuntimeError(f"sokutou at {self._settings.sokutou_url} is not reachable: {exc}") from None
+        with wave.open(BytesIO(data), "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                raise RuntimeError("sokutou returned audio that is not mono 16-bit WAV")
+            return _pcm16_to_float32(wav.readframes(wav.getnframes())), wav.getframerate()
+
+    def _get(self, path: str, *, timeout: float) -> tuple[int, bytes]:
+        try:
+            with urllib.request.urlopen(self._settings.sokutou_url + path, timeout=timeout) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+
+class _ImplausibleDuration(Exception):
+    pass
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    raw = exc.read()
+    try:
+        detail = json.loads(raw).get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    return str(detail) if detail is not None else raw.decode("utf-8", "replace")[:300]
+
+
 class IrodoriSynthesizer:
     def __init__(self, settings: IrodoriSettings, *, gpu_probe=nvidia_gpu_uuid_for_pid) -> None:
         self._settings = settings
@@ -1618,6 +1821,10 @@ class IrodoriSynthesizer:
             worker = SpeechCppWorker(self._settings, gpu_probe=self._gpu_probe)
             worker.start()
             return worker
+        if self._settings.backend == "sokutou":
+            client = SokutouClient(self._settings)
+            client.start()
+            return client
 
         from irodori_tts.inference_runtime import InferenceRuntime, RuntimeKey, download_hf_checkpoint
 
@@ -1654,6 +1861,10 @@ class IrodoriSynthesizer:
                 normalized_text=normalized_text,
             )
             return self._pcm_response(pcm, response_format)
+        if self._settings.backend == "sokutou":
+            audio, sample_rate = self.load_runtime().synthesize(self._sokutou_request(normalized_text, num_steps))
+            pcm = self._speech_pcm16(audio, source_sample_rate=sample_rate, normalized_text=normalized_text)
+            return self._pcm_response(pcm, response_format)
 
         from irodori_tts.inference_runtime import SamplingRequest
 
@@ -1665,9 +1876,12 @@ class IrodoriSynthesizer:
             and len(normalized_text) <= self._settings.short_duration_max_chars
         ):
             duration_scale = self._settings.short_duration_scale
+        extra = {}
+        if self._settings.caption_cfg_scale is not None:
+            extra["cfg_scale_caption"] = self._settings.caption_cfg_scale
         result = runtime.synthesize(
             SamplingRequest(
-                text=normalized_text,
+                text=self._model_text(normalized_text),
                 caption=self._settings.caption,
                 ref_wav=str(ref_wav),
                 no_ref=False,
@@ -1678,6 +1892,7 @@ class IrodoriSynthesizer:
                 lora_adapter=None
                 if self._settings.lora_adapter is None
                 else str(self._settings.lora_adapter),
+                **extra,
             ),
             log_fn=None,
         )
@@ -1690,12 +1905,14 @@ class IrodoriSynthesizer:
 
     def _speechcpp_request(self, normalized_text: str, num_steps: int | None) -> dict[str, object]:
         settings = self._settings
-        request: dict[str, object] = {"text": normalized_text, "voice": settings.voice}
+        request: dict[str, object] = {"text": self._model_text(normalized_text), "voice": settings.voice}
         steps = settings.num_steps if num_steps is None else num_steps
         if steps is not None:
             request["steps"] = steps
         if settings.caption:
             request["instructions"] = settings.caption
+        if settings.caption_cfg_scale is not None:
+            request["cfg_scale_instructions"] = settings.caption_cfg_scale
         short = settings.short_duration_max_chars > 0 and len(normalized_text) <= settings.short_duration_max_chars
         if short and settings.duration_cap_mora_per_second > 0:
             # speech.cpp has no max_seconds for Irodori, and v4 over-predicts short phrases and
@@ -1708,16 +1925,49 @@ class IrodoriSynthesizer:
                 request["duration_scale"] = duration_scale
         return request
 
+    def _sokutou_request(self, normalized_text: str, num_steps: int | None) -> dict[str, object]:
+        settings = self._settings
+        if num_steps is not None and num_steps != settings.num_steps:
+            raise ValueError(f"the sokutou engine runs {settings.num_steps} steps, not {num_steps}")
+        # No seed, as with speech.cpp: every request samples anew.
+        body: dict[str, object] = {
+            "input": self._model_text(normalized_text),
+            "voice": settings.voice,
+            "response_format": "wav",
+        }
+        short = settings.short_duration_max_chars > 0 and len(normalized_text) <= settings.short_duration_max_chars
+        if short and settings.duration_cap_mora_per_second > 0:
+            # The same fixed length speech.cpp gets (see _speechcpp_request).
+            body["seconds"] = self._max_seconds_for(normalized_text)
+        else:
+            duration_scale = settings.short_duration_scale if short else settings.duration_scale
+            if duration_scale != 1.0:
+                body["speed"] = round(1.0 / duration_scale, 6)
+        return body
+
+    def _model_text(self, normalized_text: str) -> str:
+        """The text the model reads: the style emoji goes after normalization, which would
+        otherwise miss its fixed phrases, and stays out of the cache key and the length cap."""
+        settings = self._settings
+        emoji = settings.style_emoji
+        if settings.sympathy_emoji and _SYMPATHY_RE.search(normalized_text):
+            emoji = settings.sympathy_emoji
+        return f"{emoji}{normalized_text}" if emoji else normalized_text
+
     def model_loaded(self) -> bool:
-        if isinstance(self._runtime, SpeechCppWorker):
+        if isinstance(self._runtime, (SpeechCppWorker, SokutouClient)):
             return self._runtime.running
         return self._runtime is not None
+
+    def sokutou_engine(self) -> dict | None:
+        """The container's /v1/engine answer from the last start, or None."""
+        return self._runtime.engine if isinstance(self._runtime, SokutouClient) else None
 
     def runtime_gpu_uuid(self) -> str | None:
         return self._runtime.gpu_uuid if isinstance(self._runtime, SpeechCppWorker) else None
 
     def close(self) -> None:
-        if isinstance(self._runtime, SpeechCppWorker):
+        if isinstance(self._runtime, (SpeechCppWorker, SokutouClient)):
             self._runtime.close()
 
     def _speech_pcm16(self, audio: object, *, source_sample_rate: int, normalized_text: str) -> bytes:
@@ -1970,6 +2220,11 @@ def create_app(settings: IrodoriSettings | None = None, synthesizer: IrodoriSynt
             await asyncio.to_thread(resolved_synthesizer.close)
 
     speechcpp = resolved_settings.backend == "speechcpp"
+    sokutou = resolved_settings.backend == "sokutou"
+
+    def _sokutou_num_steps() -> int | None:
+        engine = resolved_synthesizer.sokutou_engine() if hasattr(resolved_synthesizer, "sokutou_engine") else None
+        return engine.get("num_steps") if engine else None
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
@@ -1977,6 +2232,10 @@ def create_app(settings: IrodoriSettings | None = None, synthesizer: IrodoriSynt
             "status": "ok",
             "backend": resolved_settings.backend,
             "voice": resolved_settings.voice,
+            "caption": resolved_settings.caption,
+            "caption_cfg_scale": resolved_settings.caption_cfg_scale,
+            "style_emoji": resolved_settings.style_emoji,
+            "sympathy_emoji": resolved_settings.sympathy_emoji,
             "checkpoint": str(
                 resolved_settings.speechcpp_model
                 if speechcpp
@@ -1985,11 +2244,14 @@ def create_app(settings: IrodoriSettings | None = None, synthesizer: IrodoriSynt
             "model_loaded": resolved_synthesizer.model_loaded()
             if hasattr(resolved_synthesizer, "model_loaded")
             else resolved_synthesizer._runtime is not None,
-            "watermark": not speechcpp,
+            # Only the PyTorch runtime embeds Irodori's watermark; sokutou removes it at start.
+            "watermark": resolved_settings.backend == "python",
             "speechcpp_device": resolved_settings.speechcpp_device if speechcpp else None,
             "speechcpp_gpu_uuid": resolved_synthesizer.runtime_gpu_uuid()
             if speechcpp and hasattr(resolved_synthesizer, "runtime_gpu_uuid")
             else None,
+            "sokutou_url": resolved_settings.sokutou_url if sokutou else None,
+            "sokutou_num_steps": _sokutou_num_steps() if sokutou else None,
             "reference_source_exists": resolved_settings.reference_source.is_file(),
             "reference_wav_exists": resolved_settings.reference_wav.is_file(),
             "fixed_open_campus_greeting_ready": (

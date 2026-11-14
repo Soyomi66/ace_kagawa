@@ -227,5 +227,6 @@ def tokkio_avatar_prompt(variant_root: Path = ROOT) -> str:
         import yaml
     finally:
         sys.path.pop(0)
-    context = yaml.safe_load(custom.CONFIG_YAML)["OpenAILLMContext"]
+    # build_config_yaml() adds the spoken-style block the controller gets by default.
+    context = yaml.safe_load(custom.build_config_yaml())["OpenAILLMContext"]
     return context["prompt"].replace("{name}", context["name"])

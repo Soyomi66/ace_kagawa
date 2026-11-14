@@ -161,7 +161,7 @@ python3 check_tokkio_endpoints.py \
 
 現在の `stop` は host 側サービス停止の前に `app` namespace の `Deployment` / `StatefulSet` を `replicas=0` へ落として GPU を使う Tokkio workload を静止します。退避した replica 数は `/home/kyano/workspace/ACE/ace_kagawa/infra/tokkio/workspace/controller/generated/app-workload-replicas.tsv` に保存され、次の `start` で復元されます。
 
-停止待ちでは、`Failed` / `Succeeded` の Pod（以前の ReplicaSet が残した `Error`・`ContainerStatusUnknown`・`Completed` の Pod）は数えません。これらは replica を 0 にしても消えないため、数えると毎回タイムアウトしていました。それでも動作中の Pod が残った場合、`stop` は TTS と host 側サービスの停止まで続けてから、終了コード 1 で終わります。vLLM コンテナ（`ace-vllm-llama31-swallow-8b`）は `stop` では止まりません。止めるときは `containerd` を止める前に `docker stop` してください（後に回すと docker が終了を検知できず、状態が `Up` のまま残ります）。
+停止待ちでは、`Failed` / `Succeeded` の Pod（以前の ReplicaSet が残した `Error`・`ContainerStatusUnknown`・`Completed` の Pod）は数えません。これらは replica を 0 にしても消えないため、数えると毎回タイムアウトしていました。それでも動作中の Pod が残った場合、`stop` は TTS と host 側サービスの停止まで続けてから、終了コード 1 で終わります。vLLM コンテナ（`ace-vllm-llama31-swallow-8b`、Gemma 4 に切り替えた後は `ace-vllm-gemma4-12b`）は `stop` では止まりません。止めるときは `containerd` を止める前に `docker stop` してください（後に回すと docker が終了を検知できず、状態が `Up` のまま残ります）。
 
 起動だけで戻らない場合:
 
@@ -175,6 +175,47 @@ python3 check_tokkio_endpoints.py \
 ./manage_tokkio.sh restart-controller --env-file .env
 ./manage_tokkio.sh logs controller --env-file .env
 ```
+
+### ローカル LLM を Gemma 4 12B（FP8）に切り替える
+
+2026-10-28 の比較（`docs/audits/llm-candidates-2026-10-28.md`）で Swallow-8B の後継に選んだ構成です。port 8011 と GPU0 の枠（`--gpu-memory-utilization 0.55`、`--max-model-len 16384`）は Swallow と同じです。
+
+モデル名は `gemma-4-12b-it` です。次の 3 か所がそろっている必要があります。
+
+- `infra/llm/docker-compose.gemma4-12b.yml` の `--served-model-name`
+- `.env` の `TOKKIO_LLM_MODEL`
+- `tokkio_llm.py` の `nvidia_model_input_params`。名前に `gemma-4` を含むと、比較で使った生成設定（温度 0.1、top_p 0.95、top_k 64、最大 512 トークン、思考オフ）を送ります。
+
+前提:
+
+- GPU0 に約 27 GB の空きが要ります。空きが `0.55 × 48 GB` に足りないと vLLM は起動しません。`nvidia-smi` で確かめてください。
+- bf16 のままでは枠に入らないため（KV キャッシュが 0.36 GiB しか残らない）、読み込み時に FP8 へ量子化します（`--quantization fp8`）。
+- vLLM 0.9.2 は Gemma 4 を読めません。比較で使った版と同じ `vllm/vllm-openai:v0.32.0-cu129` を使います。ただしこのイメージの torchcodec は CUDA 13 用で、`libnvrtc.so.13` が無いため起動に失敗します。そこで torchcodec を外した派生イメージ（`infra/llm/Dockerfile.vllm-cu129`、`ace/vllm-openai:v0.32.0-cu129-no-torchcodec`）をローカルでビルドして使います。
+- `docker compose up` / `docker start` には containerd が要ります。Tokkio の `stop` 後は止まっています（`systemctl is-active containerd`）。
+
+切り替え（repo root で実行）:
+
+```bash
+docker pull vllm/vllm-openai:v0.32.0-cu129
+docker compose -f infra/llm/docker-compose.gemma4-12b.yml build   # 派生イメージ（数秒）
+docker stop ace-vllm-llama31-swallow-8b        # 戻すときに使うので削除しない
+docker compose -f infra/llm/docker-compose.gemma4-12b.yml up -d
+docker logs -f ace-vllm-gemma4-12b             # "Application startup complete" まで。初回は数分
+python3 infra/llm/check_llm_endpoint.py --base-url http://127.0.0.1:8011/v1 --model gemma-4-12b-it
+```
+
+続けて `.env` の `TOKKIO_LLM_MODEL` を `gemma-4-12b-it` に変えます（`TOKKIO_LLM_BASE_URL` はそのまま）。Tokkio が止まっていれば `./manage_tokkio.sh start --env-file .env`、動いていれば `./manage_tokkio.sh restart-controller --env-file .env` を実行します。どちらも `prepare_tokkio_workspace.py` で config を作り直し、`tokkio_llm.py` と `config.yaml` を controller に同期します。
+
+Tokkio なしのローカル経路（`infra/local_avatar/`）も同じ LLM を使います。`infra/local_avatar/profiles/kagawa.json` の `llm_model` も `gemma-4-12b-it` に変え、起動時の案内用に `LOCAL_AVATAR_LLM_CONTAINER=ace-vllm-gemma4-12b` を設定してください。
+
+戻し方:
+
+```bash
+docker stop ace-vllm-gemma4-12b
+docker start ace-vllm-llama31-swallow-8b
+```
+
+`.env` の `TOKKIO_LLM_MODEL`（ローカル経路を使うなら `kagawa.json` の `llm_model` も）を `llama-3.1-swallow-8b-instruct-v0.5` に戻し、同じく `start` か `restart-controller` を実行します。
 
 ## Important Notes
 
@@ -195,6 +236,62 @@ python3 infra/tokkio/customize_tokkio_japanese.py \
 ```
 
 通常は個別実行は不要で、`./manage_tokkio.sh start --env-file .env` または `./manage_tokkio.sh reapply --env-file .env` の前に `prepare_tokkio_workspace.py` が自動で同じパッチを当てます。
+
+### 応答開始までの時間（話し終わり判定・最初の句）
+
+話し終わりから最初の声までを縮めるため、`customize_tokkio_japanese.py` の `CONFIG_YAML` で次の 2 点を設定しています。値を変えたら `prepare_tokkio_workspace.py` と `manage_tokkio.sh reapply` で反映します。
+
+- `TurnTaking`: ユーザーの発話を LLM へ送るタイミング。Silero VAD が `vad_stop_secs` 秒の無音を検出し、かつ Riva の確定結果（`asr_stop_history_ms` ミリ秒の無音＋認識処理の後に届く）がそろった時点で送ります。確定結果が VAD より後に届くと、届いてからさらに `aggregation_timeout_s` 秒待ちます。そのため Riva の値は VAD の値より十分小さくしてください。既定値は 0.6 秒 / 500 ms / 0.05 秒です（pipecat の初期値は 0.8 秒 / 500 ms / 0.5 秒）。集約待ちが 0.05 秒なのは、既定の `SpeechCppSTTService` が発話ごとに 1 回、VAD の停止後に結果を返すためです（下の「音声認識」）。VAD 0.6 秒は 2026-10-17 から試行中です。`RivaASRService` に戻すときは VAD も 0.8 秒に戻します。短くするほど、言いよどみの途中で送られやすくなります。
+  - Riva を 250 ms にすると、短い間で発話が細切れの確定結果になり、切れ目の文字が落ちます（2026-10-17 の実マイク会話で「こんにちは」→「お」「にちは」、合成音声の質問 160 本で CER 22.7%。500 ms では 5.3%）。500 ms のまま VAD を 0.5 秒にすると、約半数の発話で確定結果が VAD より後に届き、途中までの文が LLM へ送られるので、VAD は 0.8 秒にします。詳細は `docs/audits/speech-cpp-asr-2026-10-17.md`。
+- `IrodoriTTSService.start_on_first_clause: true`: 回答の最初の読点までを、文末を待たずに TTS へ送ります。読点の前が英数字・かな漢字で 4 文字未満（「はい、」など）なら切りません。2 文目以降は従来どおり文単位です。英語モード（`QwenTTSService`）には適用しません。
+
+`TurnTaking` の節がない古い config では pipecat の初期値で動き、`start_on_first_clause` がなければ従来どおり文末まで待ちます。
+
+### 会話の切り替え（言い終わり判定・割り込み・話し方）
+
+次の 3 つは `.env` で切り替えます。`TOKKIO_TURN_END` と `TOKKIO_BARGE_IN` の既定は off で、off のときの動きは上の「応答開始までの時間」のとおりです。`TOKKIO_SPOKEN_STYLE` の既定は on です（2026-11-13 に人物設定のプロンプトを会話向けに書き直したときに変えました）。**どれも実マイクでは確かめていません。** 仕組みとオフラインの評価は `docs/audits/turn-taking-2026-11-13.md` にあります。
+
+| `.env` | 値（先頭が既定） | on にしたときの動き |
+| --- | --- | --- |
+| `TOKKIO_TURN_END` | `vad` / `text` | `text`: VAD は 0.2 秒で止まり、文字起こしの文末で言い終わりを判定します。丁寧な文末（です、ます、か、ください）はすぐ、普通形と短い返事（〜た、はい）は無音 0.6 秒、続きがある形（の、けど、えっと）は無音 0.8 秒で LLM に渡します。アバターの声が出る前に来訪者が話を続けたら、応答を取り消して 1 つの発話にまとめます |
+| `TOKKIO_BARGE_IN` | `immediate` / `gated` | `gated`: アバターが話している間は、相づち（うん、はい）と雑音では止まりません。発話が 0.6 秒続くか、短い発話の文字起こしが相づちでなければ止まります。`text` と一緒に使う前提です |
+| `TOKKIO_SPOKEN_STYLE` | `on` / `off` | `on`: 人物設定のプロンプトに、話し言葉の文末（「〜ですね」「〜ですよ」）で答える指示を足します。`off`: 「です・ます」だけで答えます |
+
+- 反映するには、`.env` を書き換えてから `./manage_tokkio.sh sync-controller --env-file .env` を実行します。戻すときは値を既定に戻して同じコマンドを実行します。
+- 細かい値（待ち時間、相づちの一覧、「そうですね」の扱い）は、生成された `config.yaml` の `TurnTaking` にあります。変えるときは `customize_tokkio_japanese.py` の `CONFIG_YAML` を書き換えます。
+- 英語モード（`TOKKIO_TTS_PROCESSOR=QwenTTSService`）では、3 つとも off として設定を作ります。
+
+### 資料にない質問への答え方
+
+人物設定のプロンプト（`customize_tokkio_japanese.py` の `CONFIG_YAML`）と RAG ルーター（`tokkio_rag.py`）は、質問を次の 3 種類に分けて答えます。
+
+| 質問の種類 | 答え方 |
+| --- | --- |
+| 雑談、一般的な知識、考えや助言 | 資料がなくても、学長・研究者としての考えで答えます |
+| 東京工科大学の数値・日程・制度・人名、経歴や業績の細部 | 固定プロフィールか RAG の参考情報にあるときだけ答えます。ないときは、正確なところは手元にないと伝え、大学の窓口や公式サイトを案内します |
+| 固定プロフィールにない私生活や体験（好きな食べ物、趣味、家族、研究者になった理由など） | 本人の事実として作りません。AI の自分はそこまで本人から聞いていない、と伝えます |
+
+- RAG の検索結果が質問に合わなかったとき、以前は固定の断り文を返していました。今は LLM に渡し、作ってはいけない範囲を書いた「回答メモ」（`local_rag.py` の `ungrounded_prompt_note`）を付けます。索引の読み込みに失敗したときだけ、固定の文を返します。
+- AI かどうかを聞かれたら、本人の分身として学生が開発した AI アバターだと答えます。
+- 本番の LLM（Gemma 4 26B）に本番と同じルーターを通して送った結果は `/data/ACE/llm-eval/2026-11-13-conversation/` にあります。実マイクでは確かめていません。
+- controller のログでは、`Turn end (`（言い終わりの判定と秒数）、`Turn taken back`（取り消しと結合）、`Backchannel while the avatar speaks`（捨てた相づち）、`Barge-in`（割り込み）の行で動きを追えます。
+
+### 音声認識（Riva / speech.cpp）
+
+`CONFIG_YAML` の `Pipeline.stt_processor` で音声認識を選びます。既定は 2026-10-17 から `SpeechCppSTTService` です。
+
+- `RivaASRService`: クラスタ内の Riva（`conformer-unified-ja-JP` ストリーミング）。途中経過も出ます。`RivaASRService` 節と `TurnTaking.asr_stop_history_ms` を使います。
+- `SpeechCppSTTService`: ホストの speech.cpp（`infra/asr/`）。VAD が区切った発話ごとに 1 回、`SpeechCppSTTService.base_url` の OpenAI 互換 API へ送ります（pipecat の `OpenAISTTService`）。途中経過は出ません。2026-11-02 から日本語は Haas-ja-v1.0（port 8024）、英語モードは Qwen3-ASR-1.7B（port 8025）です。Haas は合成音声の質問 160 本で CER 2.72%（Qwen3-ASR は 3.19%、差は有意でない）、FLEURS で 4.47%（同 5.33%、有意に良い）、「青嵐」は 16 回中 14 回（同 16 回）。詳細は `docs/audits/speech-cpp-asr-haas-2026-11-02.md`（Qwen3-ASR を選んだ 10-17 の比較は `docs/audits/speech-cpp-asr-2026-10-17.md`）。
+
+`SpeechCppSTTService` の注意点:
+
+- `model` はサーバーが返す id（`Haas-ja-v1.0`、英語モードは `Qwen3-ASR-1.7B`）です。違うと 404 になります。
+- Haas は `prompt` を受け付けません（送ると 400）。「青嵐」はサーバー側の登録語（`ace-speechcpp-asr.service` の `SPEECHCPP_ASR_KEYWORDS`）で書かせます。登録語を増やすと、遠くの話し声に登録語を書き込むことがあるので、数語にとどめます。
+- `chunking_strategy: "auto"` は必須です。サーバーの Silero VAD が話している区間だけを認識し、雑音は空文字になります（何も送られません）。外すと Haas は雑音を「うん。」と書き、LLM に渡ります。サーバーに VAD モデルがないと毎回 400 になるので、起動スクリプトは VAD モデルのファイルがなければ起動しません。
+- 英語モード（`QwenTTSService`）では `base_url` が port 8025、`model: "Qwen3-ASR-1.7B"`、`language: "en"`、`prompt: ""`、`chunking_strategy: ""` に置き換わります。Haas は日本語専用（`language=en` は 400）のためです。プロンプトだけの文字起こしを捨てる処理（`tokkio_speechcpp_stt.py`）は、`prompt` を設定したときだけ働きます。
+- 結果は VAD の停止後に届くので、`TurnTaking.aggregation_timeout_s` がそのまま上乗せされます。発話ごとに 1 回しか届かないため 0.05 秒にしています。話し終わりから LLM までは約 VAD 停止（0.6 秒）＋認識（約 0.05 秒）＋0.05 秒です。
+- `manage_tokkio.sh` の `start` / `restart` は、生成済み config.yaml が `SpeechCppSTTService` を選んでいるときだけ ASR の unit を起動します。`SpeechCppSTTService.language` が `en` なら `ace-speechcpp-asr-en.service`（`http://127.0.0.1:8025/health` を待つ）、それ以外は `ace-speechcpp-asr.service`（`http://127.0.0.1:8024/health`）で、もう一方が動いていれば止めます。`stop` は両方を止めます。Riva はそのまま残るので、`stt_processor` を戻して `sync-controller` すれば元に戻せます。
+- Qwen3-ASR に戻すには、`CONFIG_YAML` と `SPEECHCPP_STT_JA_YAML` を `model: "Qwen3-ASR-1.7B"`・`prompt: "青嵐、SEIRAN"`・`chunking_strategy: ""` にし、`ace-speechcpp-asr.service` のモデルを Qwen3-ASR に替えて VAD と登録語の行を消します（`infra/asr/README.md`）。
 
 ### オープンキャンパス挨拶
 

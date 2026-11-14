@@ -185,6 +185,76 @@ class SpeechCppBackendTests(unittest.TestCase):
         self.assertEqual(request["duration_scale"], 1.1)
         self.assertNotIn("seconds", request)
 
+    def test_caption_strength_and_style_emoji_are_off_by_default(self) -> None:
+        synth = self.synthesizer(replace(self.settings(), caption="落ち着いた声で"))
+
+        synth.synthesize("それは良かったですね。")
+
+        (request,) = self.entries("request")
+        self.assertEqual(request["text"], "それは良かったですね。")
+        self.assertNotIn("cfg_scale_instructions", request)
+
+    def test_caption_strength_is_sent_with_the_caption(self) -> None:
+        settings = self.settings(IRODORI_TTS_CAPTION="落ち着いた声で", IRODORI_TTS_CAPTION_CFG_SCALE="5")
+        synth = self.synthesizer(settings)
+
+        synth.synthesize("それは良かったですね。")
+
+        (request,) = self.entries("request")
+        self.assertEqual(request["instructions"], "落ち着いた声で")
+        self.assertEqual(request["cfg_scale_instructions"], 5.0)
+
+    def test_caption_strength_without_a_caption_is_refused(self) -> None:
+        # speech.cpp refuses an option that another leaves without effect.
+        with self.assertRaisesRegex(ValueError, "IRODORI_TTS_CAPTION_CFG_SCALE"):
+            self.settings(IRODORI_TTS_CAPTION_CFG_SCALE="5")
+
+    def test_style_emoji_goes_before_the_normalized_text_and_not_into_the_cap(self) -> None:
+        synth = self.synthesizer(self.settings(IRODORI_TTS_STYLE_EMOJI="😊"))
+
+        synth.synthesize("ありがとうございました。")
+
+        # The fixed normalization drops this phrase's 。, so the emoji must come after it.
+        normalized = irodori_server.normalize_speech_input("ありがとうございました。")
+        (request,) = self.entries("request")
+        self.assertEqual(request["text"], "😊" + normalized)
+        self.assertEqual(request["seconds"], synth._max_seconds_for(normalized))
+
+    def test_sympathy_emoji_replaces_the_style_emoji_for_bad_news(self) -> None:
+        synth = self.synthesizer(self.settings(IRODORI_TTS_STYLE_EMOJI="😊", IRODORI_TTS_SYMPATHY_EMOJI="🫶"))
+
+        for text in (
+            "残念でしたね。",
+            "オープンキャンパスは既に終了しています。",
+            "申し訳ありませんが、参考情報では確認できません。",
+            "それは良かったですね。",
+        ):
+            synth.synthesize(text)
+
+        texts = [request["text"] for request in self.entries("request")]
+        self.assertEqual(
+            texts,
+            [
+                "🫶残念でしたね。",
+                "🫶オープンキャンパスは既に終了しています。",
+                "🫶申し訳ありませんが、参考情報では確認できません。",
+                "😊それは良かったですね。",
+            ],
+        )
+
+    def test_sympathy_emoji_alone_leaves_other_sentences_plain(self) -> None:
+        synth = self.synthesizer(self.settings(IRODORI_TTS_SYMPATHY_EMOJI="🫶"))
+
+        synth.synthesize("残念でしたね。")
+        synth.synthesize("それは良かったですね。")
+
+        texts = [request["text"] for request in self.entries("request")]
+        self.assertEqual(texts, ["🫶残念でしたね。", "それは良かったですね。"])
+
+    def test_style_emoji_must_not_be_speakable_text(self) -> None:
+        with self.assertRaisesRegex(ValueError, "IRODORI_TTS_STYLE_EMOJI"):
+            self.settings(IRODORI_TTS_STYLE_EMOJI="笑顔")
+
     def test_worker_error_raises_and_the_worker_stays_usable(self) -> None:
         synth = self.synthesizer()
 
@@ -270,6 +340,36 @@ class SpeechCppBackendTests(unittest.TestCase):
         self.assertEqual(after["speechcpp_device"], "Vulkan1")
         self.assertEqual(after["speechcpp_gpu_uuid"], "GPU-seen")
         self.assertFalse(after["watermark"])
+        self.assertIsNone(after["caption"])
+        self.assertIsNone(after["caption_cfg_scale"])
+        self.assertIsNone(after["style_emoji"])
+        self.assertIsNone(after["sympathy_emoji"])
+
+    @unittest.skipIf(fastapi is None, "fastapi is not installed")
+    def test_healthz_reports_the_caption(self) -> None:
+        from fastapi.testclient import TestClient
+
+        settings = self.settings(IRODORI_TTS_CAPTION="目の前の相手と気さくに会話している。")
+        client = TestClient(irodori_server.create_app(settings, self.synthesizer(settings)))
+
+        self.assertEqual(client.get("/healthz").json()["caption"], "目の前の相手と気さくに会話している。")
+
+    @unittest.skipIf(fastapi is None, "fastapi is not installed")
+    def test_healthz_reports_the_caption_strength_and_emoji(self) -> None:
+        from fastapi.testclient import TestClient
+
+        settings = self.settings(
+            IRODORI_TTS_CAPTION="目の前の相手と気さくに会話している。",
+            IRODORI_TTS_CAPTION_CFG_SCALE="5",
+            IRODORI_TTS_STYLE_EMOJI="😊",
+            IRODORI_TTS_SYMPATHY_EMOJI="🫶",
+        )
+        client = TestClient(irodori_server.create_app(settings, self.synthesizer(settings)))
+
+        health = client.get("/healthz").json()
+        self.assertEqual(health["caption_cfg_scale"], 5.0)
+        self.assertEqual(health["style_emoji"], "😊")
+        self.assertEqual(health["sympathy_emoji"], "🫶")
 
 
 if __name__ == "__main__":
