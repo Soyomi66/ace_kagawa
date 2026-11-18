@@ -32,6 +32,8 @@ v4.1-Small / MF は香川先生の参照音声で「はい。」のような短�
 
 推定モーラ数はかな 1、漢字 1.7、数字 1.5、英大文字は文字名の長さ（`W`・`X` 4、`H`・`R`・`Z` 3、その他 2）、英小文字 1、文中の句読点 2 で数えます。中・長文では上限が予測尺より長いので効きません。`IRODORI_TTS_DURATION_CAP_MORA_PER_SECOND=0` で無効になります。
 
+`IRODORI_TTS_DURATION_CAP_EXEMPT_WORDS`（`|` 区切り、正規化後の語）のどれかを含む短文には上限を付けず、モデルが予測した長さで話させます。unit は `ゆたか` を指定しています。上限を付けると「香川ゆたか」が「ゆか」に縮むためです（2026-11-18、「私は香川ゆたかです。」の上限は 2.25 秒、上限なしの中央値は 2.6 秒。Qwen3-ASR が「豊」と書いたのは上限ありで 20 回中 2 回、上限なしで 8 回。上限なしの音声は聞いても「ゆたか」）。「はじめまして、香川ゆたかです。」「東京工科大学学長の香川ゆたかです。」を上限なしで各 10 回作り、余分な発話は 0 回でした。
+
 ## sokutou で合成する（既定、2026-11-11〜）
 
 unit は `IRODORI_TTS_BACKEND=sokutou` で、合成だけを [sokutou](https://github.com/kosuketut/sokutou) の音声サーバーに HTTP で任せます。sokutou は同じ v4.1-Small を CUDA Graph と BF16 の DiT で速くしたもので、`ace-sokutou-tts.service` が docker コンテナとして動かします。読みの正規化、絵文字、短文の尺上限、短文キャッシュ、固定挨拶、後処理（16 kHz・トリム・フェード）は speech.cpp 版と同じです。
@@ -234,6 +236,8 @@ Tokkio 側（`infra/tokkio/tokkio_llm.py` の `SpeechSegmentBuffer`）は LLM �
 4. -0.5 dB のゲインをかけてから四捨五入で 16 bit にします（以前は透かし処理でピークが 1.003 まで出て、ほぼ毎回クリップしていました）。
 
 固定挨拶の PCM（`IRODORI_TTS_FIXED_OPEN_CAMPUS_GREETING_PCM`）も応答時に同じ詰め・フェード・ゲインを通します（ファイル自体は書き換えません）。
+
+`IRODORI_TTS_FIXED_PHRASES` は、ほかの文にも決まった音声を返します。`文=PCMファイル` を `|` で区切って並べます（16 kHz・モノラル・16 bit の生 PCM）。文は正規化してから比べるので、`私は香川豊です。` と `私は香川ゆたかです。` は同じ音声になります。ファイルがなければ警告を出して合成します。unit は、名前を聞かれたときの定型の返事「私は香川豊です。」に、2026-11-18 に聞いて選んだ 1 本（`/data/ACE/irodori/fixed-phrases/kagawa_yutaka_self_intro_16k_mono.pcm`、試聴用は同じ場所の `_preview.wav`）を当てています。`/healthz` の `fixed_phrases` で、各ファイルがあるかを確かめられます。
 
 | 環境変数 | 既定 | 内容 |
 | --- | --- | --- |

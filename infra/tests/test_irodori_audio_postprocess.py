@@ -457,6 +457,29 @@ class FixedGreetingTests(unittest.TestCase):
                 self.assertTrue(pcm)
 
 
+    def test_fixed_phrase_is_served_without_synthesis(self) -> None:
+        raw = self.greeting_samples()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_greeting(tmp, raw)
+            synthesizer = make_synthesizer(fixed_phrase_pcms=(("私は香川豊です。", path),))
+            # The key is normalized, so 香川豊 and 香川ゆたか reach the same take.
+            first, _media_type, _rate = synthesizer.synthesize("私は香川豊です。")
+            second, _media_type, _rate = synthesizer.synthesize("私は香川ゆたかです。")
+
+        self.assertEqual(synthesizer._runtime.texts, [])
+        self.assertEqual(first, second)
+        self.assertLessEqual(abs(int(np.abs(decode(first)).max()) - np.abs(raw).max() * GAIN), 2)
+
+    def test_missing_fixed_phrase_file_falls_back_to_synthesis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, fake_irodori_package():
+            synthesizer = make_synthesizer(fixed_phrase_pcms=(("私は香川豊です。", Path(tmp) / "missing.pcm"),))
+
+            with self.assertLogs("irodori_server", level="WARNING"):
+                synthesizer.synthesize("私は香川豊です。")
+
+        self.assertEqual(synthesizer._runtime.texts, ["私は香川ゆたかです。"])
+
+
 class SpeakableTextTests(unittest.TestCase):
     def test_unspeakable_text_returns_empty_audio_without_the_runtime(self) -> None:
         with fake_irodori_package():

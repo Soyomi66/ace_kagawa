@@ -215,6 +215,21 @@ class SokutouBackendTests(unittest.TestCase):
         self.assertGreater(len(pcm), 0)
         self.assertLessEqual(len(pcm) // 2, 8000)
 
+    def test_short_text_with_an_exempt_word_keeps_the_predicted_length(self) -> None:
+        fake = self.start_fake()
+        synth = self.synthesizer(
+            self.settings(fake.url, IRODORI_TTS_DURATION_CAP_EXEMPT_WORDS="ゆたか|ほか")
+        )
+
+        synth.synthesize("私は香川豊です。")
+        synth.synthesize("少々お待ちください。")
+
+        exempt, capped = fake.bodies
+        self.assertEqual(exempt["input"], "私は香川ゆたかです。")
+        self.assertNotIn("seconds", exempt)
+        self.assertIn("seconds", capped)
+        self.assertEqual(synth._max_seconds_for("私は香川ゆたかです。"), irodori_server.MAX_SYNTHESIS_SECONDS)
+
     def test_long_text_keeps_the_predicted_length(self) -> None:
         fake = self.start_fake()
         synth = self.synthesizer(self.settings(fake.url))

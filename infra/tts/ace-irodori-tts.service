@@ -14,6 +14,9 @@ Environment=PYTHONPATH=/home/kyano/workspace/ACE/ace_kagawa:/home/kyano/workspac
 Environment=HF_HOME=/data/ACE/irodori/hf-cache
 Environment=IRODORI_TTS_DATA_ROOT=/data/ACE/irodori
 Environment=IRODORI_TTS_FIXED_OPEN_CAMPUS_GREETING_PCM=/data/ACE/irodori/fixed-phrases/open_campus_greeting_16k_mono.pcm
+# The fixed reply to a name question, a take chosen by ear on 2026-11-18: capped takes squeezed
+# 香川ゆたか into ゆか (/data/ACE/irodori/benchmarks/20261118_yen_reading/yutaka).
+Environment="IRODORI_TTS_FIXED_PHRASES=私は香川豊です。=/data/ACE/irodori/fixed-phrases/kagawa_yutaka_self_intro_16k_mono.pcm"
 Environment=IRODORI_TTS_HOST=0.0.0.0
 Environment=IRODORI_TTS_PORT=8021
 Environment=IRODORI_TTS_VOICE=kagawa
@@ -26,6 +29,9 @@ Environment=IRODORI_TTS_SHORT_DURATION_MAX_CHARS=16
 Environment=IRODORI_TTS_SHORT_DURATION_SCALE=1.0
 Environment=IRODORI_TTS_DURATION_CAP_BASE_SECONDS=0.4
 Environment=IRODORI_TTS_DURATION_CAP_MORA_PER_SECOND=6.0
+# Short texts with the name keep the predicted length: under the cap Qwen3-ASR heard 豊 in 2 of 20
+# takes of 私は香川ゆたかです。, uncapped in 8 of 20, and the uncapped takes sound like ゆたか by ear.
+Environment=IRODORI_TTS_DURATION_CAP_EXEMPT_WORDS=ゆたか
 Environment=IRODORI_TTS_TRIM_ENABLED=true
 Environment=IRODORI_TTS_TRIM_LEAD_MS=60
 Environment=IRODORI_TTS_SENTENCE_TRAIL_MS=300

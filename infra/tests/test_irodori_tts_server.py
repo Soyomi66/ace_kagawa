@@ -76,6 +76,8 @@ class IrodoriTtsServerTests(unittest.TestCase):
                 "IRODORI_TTS_SHORT_DURATION_MAX_CHARS": "12",
                 "IRODORI_TTS_SHORT_DURATION_SCALE": "0.75",
                 "IRODORI_TTS_FIXED_OPEN_CAMPUS_GREETING_PCM": "/tmp/fixed-greeting.pcm",
+                "IRODORI_TTS_FIXED_PHRASES": "私は香川豊です。=/tmp/yutaka.pcm | はい。=/tmp/hai.pcm",
+                "IRODORI_TTS_DURATION_CAP_EXEMPT_WORDS": "ゆたか|ほか",
                 "IRODORI_TTS_STREAM_CHUNK_BYTES": "6400",
                 "IRODORI_TTS_PROGRESSIVE_STREAM_ENABLED": "true",
                 "IRODORI_TTS_PROGRESSIVE_MAX_SEGMENTS": "4",
@@ -93,6 +95,11 @@ class IrodoriTtsServerTests(unittest.TestCase):
         self.assertEqual(settings.short_duration_max_chars, 12)
         self.assertEqual(settings.short_duration_scale, 0.75)
         self.assertEqual(settings.fixed_open_campus_greeting_pcm, Path("/tmp/fixed-greeting.pcm"))
+        self.assertEqual(
+            settings.fixed_phrase_pcms,
+            (("私は香川豊です。", Path("/tmp/yutaka.pcm")), ("はい。", Path("/tmp/hai.pcm"))),
+        )
+        self.assertEqual(settings.duration_cap_exempt_words, ("ゆたか", "ほか"))
         self.assertEqual(getattr(settings, "stream_chunk_bytes", None), 6400)
         self.assertIs(getattr(settings, "progressive_stream_enabled", None), True)
         self.assertEqual(getattr(settings, "progressive_max_segments", None), 4)
