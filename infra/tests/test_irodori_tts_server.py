@@ -266,7 +266,7 @@ class IrodoriTtsServerTests(unittest.TestCase):
         self.assertEqual(
             normalized,
             "二千二十七年度にメディア学部へ入学する場合、"
-            "いちねんめ前期の合計はきゅうじゅうななまんろくせんさんびゃくえんです。",
+            "いちねんめ前期の合計は九十七万六千三百円です。",
         )
 
     def test_normalize_speech_input_verbalizes_multiple_tuition_amounts(self) -> None:
@@ -276,8 +276,7 @@ class IrodoriTtsServerTests(unittest.TestCase):
 
         self.assertEqual(
             normalized,
-            "入学金にじゅうごまんえん、授業料ななじゅうまんさんぜんえん、"
-            "諸会費にまんさんぜんさんびゃくえんです。",
+            "入学金二十五万円、授業料七十万三千円、諸会費二万三千三百円です。",
         )
 
     def test_normalize_speech_input_handles_dates_percentages_and_phone_numbers(self) -> None:
@@ -392,8 +391,8 @@ class IrodoriTtsServerTests(unittest.TestCase):
 
     def test_normalize_speech_input_reads_money_decimals_and_units(self) -> None:
         cases = {
-            "1000万円と1億円です。": "いっせん万円といち億円です。",
-            "10000000円です。": "いっせんまんえんです。",
+            "1000万円と1億円です。": "千万円といち億円です。",
+            "10000000円です。": "千万円です。",
             "¥5,000です。": "ごせんえんです。",
             "0.5秒です。": "れいてんご秒です。",
             "36.5℃、100m、5km、10kgです。": (

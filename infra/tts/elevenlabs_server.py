@@ -89,7 +89,8 @@ class ElevenLabsSettings:
 
 def build_speech_request(settings: ElevenLabsSettings, text: str) -> tuple[str, dict[str, object]]:
     """Return the ElevenLabs streaming URL and JSON body for one utterance."""
-    spoken = normalize_speech_input(text) if settings.normalize_text else text.strip()
+    # Kanji yen amounts are measured on Irodori only; ElevenLabs keeps the kana reading.
+    spoken = normalize_speech_input(text, kanji_yen=False) if settings.normalize_text else text.strip()
     payload: dict[str, object] = {
         "text": spoken,
         "model_id": settings.model_id,

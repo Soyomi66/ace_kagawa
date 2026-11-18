@@ -138,9 +138,38 @@ class IrodoriSpeechNormalizationTests(unittest.TestCase):
                 "90京回": "きゅうじゅっけい回",
                 "100京": "ひゃっけい",
                 "第3京浜": "だいさん京浜",
-                "1000万円と1億円です。": "いっせん万円といち億円です。",
+                "1000万円と1億円です。": "千万円といち億円です。",
             }
         )
+
+    def test_large_yen_amounts_use_kanji_numerals(self) -> None:
+        # Kana amounts were garbled in 8 of 50 takes, kanji in 0 of 50 (2026-11-18).
+        self.assert_normalized(
+            {
+                "1年目の合計は1,679,300円になります。": "いちねんめの合計は百六十七万九千三百円になります。",
+                "1679300円": "百六十七万九千三百円",
+                "167万9300円": "百六十七万九千三百円",
+                "25万円": "二十五万円",
+                "1,200万円": "千二百万円",
+                "10,000円": "一万円",
+                "99,999,999円": "九千九百九十九万九千九百九十九円",
+                "¥1,679,300": "百六十七万九千三百円",
+                "30,000円-50,000円": "三万円から五万円",
+                "3万円〜5万円": "三万円から五万円",
+                # Below 1万 and from 1億 up keep the kana reading.
+                "9,999円": "きゅうせんきゅうひゃくきゅうじゅうきゅうえん",
+                "100,000,000円": "いちおくえん",
+                "1億2000万円": "いち億にせん万円",
+                # Not yen.
+                "1万人": "いち万人",
+            }
+        )
+
+    def test_kanji_yen_can_be_turned_off(self) -> None:
+        normalize = irodori_server.normalize_speech_input
+        self.assertEqual(normalize("703,000円", kanji_yen=False), "ななじゅうまんさんぜんえん")
+        self.assertEqual(normalize("¥703,000", kanji_yen=False), "ななじゅうまんさんぜんえん")
+        self.assertEqual(normalize("25万円", kanji_yen=False), "にじゅうご万円")
 
     def test_signs_are_spoken(self) -> None:
         self.assert_normalized(
