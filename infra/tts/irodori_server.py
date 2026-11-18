@@ -172,6 +172,10 @@ _ORDINAL_PREFIX_RE = re.compile(r"(?<!次)第(?=\s*\d)")
 _MONTH_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,2})月(?!曜)")
 _DAY_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,3}(?:,\d{3})+|\d+)日")
 _YEN_SIGN_RE = re.compile(r"[¥￥]\s*(\d[\d,]*)(?![\d.])")
+# 1,679,300円, 1679300円, 167万9300円 and 25万円; amounts with 億 keep the kana path.
+_YEN_AMOUNT_RE = re.compile(
+    r"(?<![A-Za-z0-9.,億])(?:(\d{1,3}(?:,\d{3})?|\d{1,4})万(\d{1,3}(?:,\d{3})|\d{1,4})?|(\d{1,3}(?:,\d{3})+|\d+))\s*円"
+)
 _YEN_RE = re.compile(r"(?<![A-Za-z0-9])(\d[\d,]*)\s*円")
 _PERCENT_RE = re.compile(r"(?<![A-Za-z0-9])(\d[\d,]*(?:\.\d+)?)\s*(?:%|パーセント)")
 _TECH_UNIT_RE = re.compile(
@@ -464,6 +468,42 @@ def _kanji_numeral(value: int) -> str:
     if value:
         parts.append(_KANJI_DIGITS[value])
     return "".join(parts)
+
+
+# Yen amounts from here up to (not including) 1億 are spelled in kanji numerals.
+KANJI_YEN_MIN = 10_000
+
+
+def _kanji_yen(value: int) -> str | None:
+    """百六十七万九千三百円 for 1679300, or None outside [KANJI_YEN_MIN, 1億).
+
+    The model garbled kana amounts (ひゃくろくじゅうななまん… transcribed 百六百十七万,
+    はちじゅうごまんさんぜん… as 八十五万三三千) in 8 of 50 takes; the same amounts in
+    kanji numerals in none of 50 (Qwen3-ASR, sokutou, 2026-11-18).
+    """
+    if not KANJI_YEN_MIN <= value < 100_000_000:
+        return None
+    man, rest = divmod(value, 10_000)
+    return (f"{_kanji_numeral(man)}万" if man else "") + _kanji_numeral(rest) + "円"
+
+
+def _read_yen_amount(match: re.Match[str]) -> str:
+    man, man_rest, plain = match.groups()
+    if plain is not None:
+        value = int(plain.replace(",", ""))
+    else:
+        value = int(man.replace(",", "")) * 10_000 + int((man_rest or "0").replace(",", ""))
+    kanji = _kanji_yen(value)
+    if kanji is not None:
+        return kanji
+    return match.group(0)
+
+
+def _read_yen(raw_value: str, *, kanji_yen: bool) -> str:
+    """A yen amount after ¥, in kanji numerals or kana like _YEN_RE."""
+    digits = raw_value.replace(",", "")
+    kanji = _kanji_yen(int(digits)) if kanji_yen and digits.isdigit() else None
+    return kanji or f"{_read_year_value(raw_value)}えん"
 
 
 def _read_year(raw_value: str, suffix: str = "年") -> str:
@@ -760,7 +800,7 @@ def _verbalize_speech_symbols(text: str) -> str:
     return _MULTIPLICATION_RE.sub("かける", text)
 
 
-def _normalize_japanese_numbers(text: str) -> str:
+def _normalize_japanese_numbers(text: str, *, kanji_yen: bool = True) -> str:
     # The model garbles a mixed 第いち…; spell the ordinal prefix in kana as well.
     normalized = _ORDINAL_PREFIX_RE.sub("だい", text)
     for pattern, replacement in _SPACED_DATE_PATTERNS:
@@ -796,7 +836,7 @@ def _normalize_japanese_numbers(text: str) -> str:
         lambda match: _read_slash_date(None, *match.groups()) or match.group(0),
         normalized,
     )
-    normalized = _YEN_SIGN_RE.sub(lambda match: f"{_read_year_value(match.group(1))}えん", normalized)
+    normalized = _YEN_SIGN_RE.sub(lambda match: _read_yen(match.group(1), kanji_yen=kanji_yen), normalized)
     normalized = _LABEL_COLON_RE.sub(r"\1\2、", normalized)
     normalized = _TIME_RANGE_RE.sub(_read_time_range, normalized)
     normalized = _OPEN_TIME_RE.sub(
@@ -849,6 +889,8 @@ def _normalize_japanese_numbers(text: str) -> str:
         lambda match: _read_day_value(match.group(1), calendar=_is_calendar_day(match)),
         normalized,
     )
+    if kanji_yen:
+        normalized = _YEN_AMOUNT_RE.sub(_read_yen_amount, normalized)
     normalized = _YEN_RE.sub(
         lambda match: f"{_read_year_value(match.group(1))}えん",
         normalized,
@@ -925,14 +967,15 @@ def _naturalize_speech_punctuation(text: str) -> str:
     return text.strip().lstrip("、").lstrip()
 
 
-def normalize_speech_input(text: str) -> str:
+def normalize_speech_input(text: str, *, kanji_yen: bool = True) -> str:
+    """Text the model can read; ``kanji_yen`` spells large yen amounts in kanji (see _kanji_yen)."""
     normalized = _strip_speech_markdown(text.strip().translate(_FULL_WIDTH_ASCII_TRANSLATION))
     normalized = _FURIGANA_RE.sub(_read_furigana, normalized)
     # Hints run before numbers so that e.g. "TOP 500" is still intact.
     for pattern, replacement in PRONUNCIATION_HINTS:
         normalized = pattern.sub(replacement, normalized)
     normalized = _verbalize_speech_symbols(normalized)
-    normalized = _normalize_japanese_numbers(normalized)
+    normalized = _normalize_japanese_numbers(normalized, kanji_yen=kanji_yen)
     normalized = _naturalize_speech_punctuation(normalized)
     return FIXED_SPEECH_NORMALIZATIONS.get(normalized, normalized)
 
