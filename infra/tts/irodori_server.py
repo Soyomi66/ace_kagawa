@@ -1141,6 +1141,17 @@ def _env_texts(env: Mapping[str, str], key: str) -> tuple[str, ...]:
     return tuple(text.strip() for text in raw.split("|") if text.strip())
 
 
+def _env_fixed_phrases(env: Mapping[str, str], key: str) -> tuple[tuple[str, Path], ...]:
+    """TEXT=PATH entries separated by |, e.g. 私は香川豊です。=/data/.../yutaka.pcm."""
+    phrases: list[tuple[str, Path]] = []
+    for entry in _env_texts(env, key):
+        text, sep, path = entry.partition("=")
+        if not sep or not text.strip() or not path.strip():
+            raise ValueError(f"{key} entries must be TEXT=PATH, got {entry!r}")
+        phrases.append((text.strip(), Path(path.strip()).expanduser()))
+    return tuple(phrases)
+
+
 def _check_sokutou_env(env: Mapping[str, str], *, caption: str) -> None:
     """Refuse settings the sokutou container would silently ignore or answer 422."""
     if caption:
@@ -1173,6 +1184,8 @@ class IrodoriSettings:
     reference_source: Path = DEFAULT_REFERENCE_SOURCE
     reference_wav: Path = DEFAULT_REFERENCE_WAV
     fixed_open_campus_greeting_pcm: Path = DEFAULT_FIXED_OPEN_CAMPUS_GREETING_PCM
+    # Phrases answered with a chosen 16 kHz mono PCM16 take instead of synthesis (text, path).
+    fixed_phrase_pcms: tuple[tuple[str, Path], ...] = ()
     voice: str = DEFAULT_VOICE
     caption: str | None = None
     # How strongly the caption steers the delivery (speech.cpp cfg_scale_instructions, PyTorch
@@ -1211,6 +1224,9 @@ class IrodoriSettings:
     # base + estimated mora / rate. A rate <= 0 disables the cap.
     duration_cap_base_seconds: float = 0.7
     duration_cap_mora_per_second: float = 6.0
+    # Short texts containing one of these (normalized) words get no length cap: the cap
+    # squeezed 香川ゆたか into ゆか, which the uncapped length does not (2026-11-18).
+    duration_cap_exempt_words: tuple[str, ...] = ()
     # Every clip carries ~0.23 s lead and ~0.42 s trail of model noise padding. Keep this
     # much around the speech (a longer trail after a sentence end), fade the cut edges,
     # and leave headroom for the codec's overshoot above full scale.
@@ -1285,6 +1301,7 @@ class IrodoriSettings:
                 "IRODORI_TTS_FIXED_OPEN_CAMPUS_GREETING_PCM",
                 DEFAULT_FIXED_OPEN_CAMPUS_GREETING_PCM,
             ),
+            fixed_phrase_pcms=_env_fixed_phrases(values, "IRODORI_TTS_FIXED_PHRASES"),
             voice=values.get("IRODORI_TTS_VOICE", DEFAULT_VOICE).strip() or DEFAULT_VOICE,
             caption=caption_raw or None,
             caption_cfg_scale=caption_cfg_scale,
@@ -1313,6 +1330,7 @@ class IrodoriSettings:
                 "IRODORI_TTS_DURATION_CAP_MORA_PER_SECOND",
                 6.0,
             ),
+            duration_cap_exempt_words=_env_texts(values, "IRODORI_TTS_DURATION_CAP_EXEMPT_WORDS"),
             max_ref_seconds=_env_optional_float(values, "IRODORI_TTS_MAX_REF_SECONDS"),
             response_sample_rate_hz=_env_int(values, "IRODORI_TTS_RESPONSE_SAMPLE_RATE_HZ", 16000),
             preload_model=_env_bool(values, "IRODORI_TTS_PRELOAD_MODEL", False),
@@ -1849,6 +1867,7 @@ class IrodoriSynthesizer:
         # Prewarmed phrases (the filler, the endpoint check's text) are never evicted by live speech.
         self._pinned_short_cache: dict[tuple[str, str], tuple[bytes, str, int]] = {}
         self._pinned_texts = {normalize_speech_input(text) for text in settings.short_cache_prewarm_texts}
+        self._fixed_phrase_paths = {normalize_speech_input(text): path for text, path in settings.fixed_phrase_pcms}
         self._short_cache_lock = Lock()
 
     def load_runtime(self):
@@ -1957,7 +1976,7 @@ class IrodoriSynthesizer:
         if settings.caption_cfg_scale is not None:
             request["cfg_scale_instructions"] = settings.caption_cfg_scale
         short = settings.short_duration_max_chars > 0 and len(normalized_text) <= settings.short_duration_max_chars
-        if short and settings.duration_cap_mora_per_second > 0:
+        if short and self._duration_capped(normalized_text):
             # speech.cpp has no max_seconds for Irodori, and v4 over-predicts short phrases and
             # fills the extra time with babble, so a short text gets the mora cap as its length
             # (2026-10-16: babble after 少々お待ちください。 9/10 -> 0/10).
@@ -1979,7 +1998,7 @@ class IrodoriSynthesizer:
             "response_format": "wav",
         }
         short = settings.short_duration_max_chars > 0 and len(normalized_text) <= settings.short_duration_max_chars
-        if short and settings.duration_cap_mora_per_second > 0:
+        if short and self._duration_capped(normalized_text):
             # The same fixed length speech.cpp gets (see _speechcpp_request).
             body["seconds"] = self._max_seconds_for(normalized_text)
         else:
@@ -2035,9 +2054,15 @@ class IrodoriSynthesizer:
             return pcm16_to_wav_bytes(pcm, sample_rate_hz=sample_rate), "audio/wav", sample_rate
         return pcm, "audio/L16", sample_rate
 
+    def _duration_capped(self, normalized_text: str) -> bool:
+        settings = self._settings
+        if settings.duration_cap_mora_per_second <= 0:
+            return False
+        return not any(word in normalized_text for word in settings.duration_cap_exempt_words)
+
     def _max_seconds_for(self, normalized_text: str) -> float:
         rate = self._settings.duration_cap_mora_per_second
-        if rate <= 0:
+        if not self._duration_capped(normalized_text):
             return MAX_SYNTHESIS_SECONDS
         cap = self._settings.duration_cap_base_seconds + estimate_speech_mora(normalized_text) / rate
         return round(min(MAX_SYNTHESIS_SECONDS, max(MIN_CAPPED_SECONDS, cap)), 3)
@@ -2137,11 +2162,14 @@ class IrodoriSynthesizer:
         *,
         response_format: str,
     ) -> tuple[bytes, str, int] | None:
-        if normalized_text != FIXED_OPEN_CAMPUS_GREETING_TEXT:
+        if normalized_text == FIXED_OPEN_CAMPUS_GREETING_TEXT:
+            fixed_path = self._settings.fixed_open_campus_greeting_pcm
+        else:
+            fixed_path = self._fixed_phrase_paths.get(normalized_text)
+        if fixed_path is None:
             return None
-
-        fixed_path = self._settings.fixed_open_campus_greeting_pcm
         if not fixed_path.is_file():
+            _logger().warning("fixed phrase PCM %s is missing; synthesizing instead", fixed_path)
             return None
 
         pcm = fixed_path.read_bytes()
@@ -2300,6 +2328,9 @@ def create_app(settings: IrodoriSettings | None = None, synthesizer: IrodoriSynt
             "fixed_open_campus_greeting_ready": (
                 resolved_settings.fixed_open_campus_greeting_pcm.is_file()
             ),
+            "fixed_phrases": {
+                text: path.is_file() for text, path in resolved_settings.fixed_phrase_pcms
+            },
             "sample_rate_hz": resolved_settings.response_sample_rate_hz,
             "short_cache_enabled": resolved_settings.short_cache_enabled,
             "short_cache_entries": resolved_synthesizer.short_cache_size()
